@@ -75,7 +75,7 @@ const HOUSE_REWARD_RAW = BigInt(Math.max(0, Math.floor(HOUSE_REWARD_AGIS * 10 **
 fs.mkdirSync(RWA_DIR, { recursive: true });
 const rwa = fs.existsSync(RWA_INDEX) ? JSON.parse(fs.readFileSync(RWA_INDEX, 'utf8')) : { jobs: {} };
 const rwaSave = () => fs.writeFileSync(RWA_INDEX, JSON.stringify(rwa, null, 1));
-const pub = j => { const vu = j.validUntil || null; const expired = !!(vu && Date.parse(vu) < Date.now()); return ({ receiptTx: j.receiptTx ?? null, receiptError: j.receiptError ?? null, receiptAt: j.receiptAt ?? null, id: j.id, fingerprint: j.fingerprint, meta: j.meta, status: j.status, created: j.created, validUntil: vu, expired, rewardEstimate: j.rewardEstimate ?? null, hasCiphertext: !!j.ctFile, keyWrap: j.keyWrap ?? null, wrapWallet: j.wrapWallet ?? null, wrapAlg: j.wrapAlg ?? null, votes: (j.votes || []).map(v => ({ wallet: v.wallet, ok: v.ok, checks: v.checks, at: v.at })), houseEcoTx: j.houseEcoTx ?? null, houseEcoAmount: j.houseEcoAmount ?? null, houseEcoTo: j.houseEcoTo ?? null }); };
+const pub = j => { const vu = j.validUntil || null; const expired = !!(vu && Date.parse(vu) < Date.now()); return ({ receiptTx: j.receiptTx ?? null, receiptError: j.receiptError ?? null, receiptAt: j.receiptAt ?? null, id: j.id, fingerprint: j.fingerprint, meta: j.meta, status: j.status, created: j.created, validUntil: vu, expired, rewardEstimate: j.rewardEstimate ?? null, hasCiphertext: !!j.ctFile, keyWrap: j.keyWrap ?? null, wrapWallet: j.wrapWallet ?? null, wrapAlg: j.wrapAlg ?? null, votes: (j.votes || []).map(v => ({ wallet: v.wallet, ok: v.ok, checks: v.checks, at: v.at })), houseEcoTx: j.houseEcoTx ?? null, houseEcoAmount: j.houseEcoAmount ?? null, houseEcoTo: j.houseEcoTo ?? null, houseEcoError: j.houseEcoError ?? null }); };
 function rwaCreate(b) {
   if (!b || typeof b.fingerprint !== 'string' || !/^[0-9a-f]{64}$/i.test(b.fingerprint)) throw 'fingerprint must be sha256 hex';
   // Privacy: we never accept or store decryption keys. Reject any key-like field.
@@ -138,27 +138,33 @@ function houseVoteIfOpen(id) {
   } catch (e) { /* already voted / settled */ }
 }
 async function houseEcoReward(id) {
-  const j = rwa.jobs[id]; if (!j || j.houseEcoTx || j.houseEcoPending) return;
-  if (HOUSE_REWARD_RAW <= 0n) { j.houseEcoNote = 'house reward disabled'; rwaSave(); return; }
-  j.houseEcoPending = true; rwaSave();
+  const j0 = rwa.jobs[id]; if (!j0 || j0.houseEcoTx || j0.houseEcoPending) return;
+  if (HOUSE_REWARD_RAW <= 0n) { j0.houseEcoNote = 'house reward disabled'; rwaSave(); return; }
+  j0.houseEcoPending = true; rwaSave();
   queue = queue.then(async () => {
+    const j = rwa.jobs[id];
+    if (!j) return;
+    if (j.houseEcoTx) { delete j.houseEcoPending; rwaSave(); return; }
     try {
       const kp = getPayer();
       const bal = await conn.getBalance(kp.publicKey, 'confirmed');
       if (bal < MIN_SOL_LAMPORTS) throw new Error('low SOL for house eco mint');
       const ata = await getOrCreateAssociatedTokenAccount(conn, kp, MINT, ECO_WALLET);
       const tx = await mintTo(conn, kp, MINT, ata.address, kp, HOUSE_REWARD_RAW);
-      j.houseEcoTx = tx;
+      j.houseEcoTx = String(tx);
       j.houseEcoAmount = Number(HOUSE_REWARD_RAW) / 10 ** DECIMALS;
       j.houseEcoTo = ECO_WALLET.toBase58();
       j.houseEcoError = null;
+      delete j.houseEcoPending;
+      rwaSave();
       console.log(new Date().toISOString(), 'house→eco', id, j.houseEcoAmount, tx);
     } catch (e) {
       j.houseEcoError = String(e.message || e).slice(0, 200);
+      delete j.houseEcoPending;
+      rwaSave();
       console.warn('houseEcoReward', id, j.houseEcoError);
     }
-    delete j.houseEcoPending; rwaSave();
-  }).catch(() => {});
+  }).catch(e => console.warn('houseEcoReward queue', id, e));
 }
 function rwaVote(id, v) {
   const j = rwa.jobs[id]; if (!j) throw 'no such job';
@@ -231,8 +237,13 @@ function rwaReceipt(j) {
       if (msg) { j.receiptTx = null; j.receiptError = msg.slice(0, 240); }
     }
     j.receiptAt = new Date().toISOString(); delete j.receiptPending; rwaSave();
+    // After on-chain receipt: if house soft-go voted, recycle reduced AGIS to eco
+    if ((j.votes || []).some(v => (v.checks || []).includes('house-softgo'))) {
+      try { houseEcoReward(j.id); } catch {}
+    }
   }).catch(() => {});
 }
+
 async function rwaReceiptRetry(id) {
   const j = rwa.jobs[id]; if (!j) throw 'no such job';
   if (j.status !== 'verified' && j.status !== 'failed') throw 'not settled';
