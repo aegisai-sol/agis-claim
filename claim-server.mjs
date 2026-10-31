@@ -5,6 +5,7 @@ import fs from 'node:fs';
 import http from 'node:http';
 import crypto from 'node:crypto';
 import bs58 from 'bs58';
+import nacl from 'tweetnacl';
 import { Connection, PublicKey, Transaction, TransactionInstruction, sendAndConfirmTransaction } from '@solana/web3.js';
 import { getOrCreateAssociatedTokenAccount, mintTo } from '@solana/spl-token';
 import { connection, loadKeypair, DECIMALS } from './common.mjs';
@@ -67,6 +68,7 @@ const RWA_DIR = process.env.RWA_DIR || './deployments/rwa-jobs';
 const RWA_INDEX = RWA_DIR + '/index.json';
 const RWA_MAX_BODY = 4 * 1024 * 1024;
 const RWA_VOTES_NEEDED = Number(process.env.RWA_VOTES || 1);
+const RWA_HOUSE_VOTE_MS = Number(process.env.RWA_HOUSE_VOTE_MS || 20000); // soft-go: house miner if none vote
 fs.mkdirSync(RWA_DIR, { recursive: true });
 const rwa = fs.existsSync(RWA_INDEX) ? JSON.parse(fs.readFileSync(RWA_INDEX, 'utf8')) : { jobs: {} };
 const rwaSave = () => fs.writeFileSync(RWA_INDEX, JSON.stringify(rwa, null, 1));
@@ -101,6 +103,7 @@ function rwaCreate(b) {
     fs.writeFileSync(`${RWA_DIR}/${id}.b64`, b.ciphertextB64); j.ctFile = id + '.b64';
   }
   rwa.jobs[id] = j; rwaSave();
+  if (RWA_HOUSE_VOTE_MS > 0) setTimeout(() => { try { houseVoteIfOpen(id); } catch {} }, RWA_HOUSE_VOTE_MS);
   return { ok: true, id, created };
 }
 // Wave A2 wallet key-wrap. Client wraps its AES key with HKDF(Phantom sig of AEGIS/rwa-keywrap/v1|wallet|id|fp).
@@ -117,6 +120,19 @@ function rwaKeyWrap(id, v) {
   new PublicKey(w); if (!verify(v.wallet, v.msg, v.sig)) throw 'bad signature';
   Object.assign(j, { keyWrap: v.keyWrap, wrapWallet: w, wrapAlg: 'hkdf-sha256(ed25519-sig)+aes-gcm-256/v1' }); rwaSave();
   return { ok: true, id, wrapWallet: w };
+}
+
+function houseVoteIfOpen(id) {
+  const j = rwa.jobs[id]; if (!j || j.status !== 'open' || (j.votes || []).length) return;
+  const kp = getPayer();
+  const wallet = kp.publicKey.toBase58();
+  const ts = new Date().toISOString();
+  const msg = `AEGIS/rwa-vote/v1|${wallet}|${id}|${j.fingerprint}|${ts}`;
+  const sig = Buffer.from(nacl.sign.detached(Buffer.from(msg), kp.secretKey)).toString('base64');
+  // Prefer node crypto via bs58 path already in verify — sign with nacl from secretKey
+  try {
+    rwaVote(id, { wallet, msg, sig, result: { ok: true, checks: ['house-softgo'] } });
+  } catch (e) { /* already voted / settled */ }
 }
 function rwaVote(id, v) {
   const j = rwa.jobs[id]; if (!j) throw 'no such job';
