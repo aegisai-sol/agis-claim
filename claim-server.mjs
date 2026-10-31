@@ -72,7 +72,7 @@ const RWA_HOUSE_VOTE_MS = Number(process.env.RWA_HOUSE_VOTE_MS || 20000); // sof
 fs.mkdirSync(RWA_DIR, { recursive: true });
 const rwa = fs.existsSync(RWA_INDEX) ? JSON.parse(fs.readFileSync(RWA_INDEX, 'utf8')) : { jobs: {} };
 const rwaSave = () => fs.writeFileSync(RWA_INDEX, JSON.stringify(rwa, null, 1));
-const pub = j => ({ receiptTx: j.receiptTx ?? null, receiptError: j.receiptError ?? null, receiptAt: j.receiptAt ?? null, id: j.id, fingerprint: j.fingerprint, meta: j.meta, status: j.status, created: j.created, rewardEstimate: j.rewardEstimate ?? null, hasCiphertext: !!j.ctFile, keyWrap: j.keyWrap ?? null, wrapWallet: j.wrapWallet ?? null, wrapAlg: j.wrapAlg ?? null, votes: (j.votes || []).map(v => ({ wallet: v.wallet, ok: v.ok, checks: v.checks, at: v.at })) });
+const pub = j => { const vu = j.validUntil || null; const expired = !!(vu && Date.parse(vu) < Date.now()); return ({ receiptTx: j.receiptTx ?? null, receiptError: j.receiptError ?? null, receiptAt: j.receiptAt ?? null, id: j.id, fingerprint: j.fingerprint, meta: j.meta, status: j.status, created: j.created, validUntil: vu, expired, rewardEstimate: j.rewardEstimate ?? null, hasCiphertext: !!j.ctFile, keyWrap: j.keyWrap ?? null, wrapWallet: j.wrapWallet ?? null, wrapAlg: j.wrapAlg ?? null, votes: (j.votes || []).map(v => ({ wallet: v.wallet, ok: v.ok, checks: v.checks, at: v.at })) }); };
 function rwaCreate(b) {
   if (!b || typeof b.fingerprint !== 'string' || !/^[0-9a-f]{64}$/i.test(b.fingerprint)) throw 'fingerprint must be sha256 hex';
   // Privacy: we never accept or store decryption keys. Reject any key-like field.
