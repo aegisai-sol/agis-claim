@@ -109,14 +109,31 @@ function rwaReceipt(j) {
   queue = queue.then(async () => {
     try {
       const kp = getPayer();
-      const bal = await conn.getBalance(kp.publicKey);
-      if (bal < MIN_SOL_LAMPORTS) throw new Error('low SOL on payer (' + bal + ' lamports)');
+      const bal = await conn.getBalance(kp.publicKey, 'confirmed');
+      if (bal < MIN_SOL_LAMPORTS) throw new Error('low SOL on payer (' + bal + ' lamports · ' + kp.publicKey.toBase58().slice(0, 8) + '…)');
       const memo = `AEGIS/rwa/v1|${j.id}|${j.fingerprint}|${j.status}`;
-      const tx = new Transaction().add(new TransactionInstruction({ programId: MEMO_PROGRAM, keys: [{ pubkey: kp.publicKey, isSigner: true, isWritable: false }], data: Buffer.from(memo, 'utf8') }));
-      j.receiptTx = await sendAndConfirmTransaction(conn, tx, [kp], { commitment: 'confirmed' }); j.receiptError = null;
-    } catch (e) { j.receiptTx = null; j.receiptError = String(e.message || e).slice(0, 160); }
+      const { blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash('confirmed');
+      const tx = new Transaction({ feePayer: kp.publicKey, blockhash, lastValidBlockHeight }).add(
+        new TransactionInstruction({ programId: MEMO_PROGRAM, keys: [{ pubkey: kp.publicKey, isSigner: true, isWritable: false }], data: Buffer.from(memo, 'utf8') })
+      );
+      tx.sign(kp);
+      const sig = await conn.sendRawTransaction(tx.serialize(), { skipPreflight: false, preflightCommitment: 'confirmed', maxRetries: 3 });
+      await conn.confirmTransaction({ signature: sig, blockhash, lastValidBlockHeight }, 'confirmed');
+      j.receiptTx = sig; j.receiptError = null;
+    } catch (e) {
+      let msg = String(e.message || e);
+      try { if (typeof e.getLogs === 'function') { const logs = await e.getLogs(); if (logs?.length) msg += ' | ' + logs.slice(0, 4).join(' · '); } } catch {}
+      j.receiptTx = null; j.receiptError = msg.slice(0, 240);
+    }
     j.receiptAt = new Date().toISOString(); delete j.receiptPending; rwaSave();
   }).catch(() => {});
+}
+function rwaReceiptRetry(id) {
+  const j = rwa.jobs[id]; if (!j) throw 'no such job';
+  if (j.status !== 'verified' && j.status !== 'failed') throw 'not settled';
+  if (j.receiptTx) return { ok: true, id, receiptTx: j.receiptTx, reused: true };
+  delete j.receiptPending; j.receiptError = null; rwaReceipt(j);
+  return { ok: true, id, retried: true };
 }
 
 async function handle(c) {
@@ -157,7 +174,10 @@ http.createServer((req, res) => {
   const out = (s, j) => { res.writeHead(s, h); res.end(JSON.stringify(j)); };
   if (req.method === 'OPTIONS') return out(204, {});
   const url = req.url.split('?')[0];
-  if (req.method === 'GET' && (url === '/' || url === '/api/health')) return out(200, { ok: true, mint: MINT.toBase58(), live: true, rwa: true, jobs: Object.keys(rwa.jobs).length });
+  if (req.method === 'GET' && (url === '/' || url === '/api/health')) {
+      let payerPk = null; try { payerPk = getPayer().publicKey.toBase58(); } catch {}
+      return out(200, { ok: true, mint: MINT.toBase58(), live: true, rwa: true, jobs: Object.keys(rwa.jobs).length, mainnet: process.env.MAINNET === '1', payer: payerPk ? payerPk.slice(0, 8) + '…' + payerPk.slice(-4) : null, rpc: (process.env.SOLANA_RPC || (process.env.MAINNET === '1' ? 'mainnet-default' : 'devnet')).replace(/api[_-]?key=[^&]+/ig, 'api_key=…') });
+    }
   if (req.method === 'GET' && url === '/api/supply') {
     return Promise.all([conn.getTokenSupply(MINT), conn.getSlot().catch(() => null)])
       .then(([s, slot]) => out(200, { ok: true, mint: MINT.toBase58(), supply: s.value.amount, uiAmount: s.value.uiAmount, uiAmountString: s.value.uiAmountString, decimals: s.value.decimals, slot }))
@@ -179,12 +199,15 @@ http.createServer((req, res) => {
       const seals = Object.values(rwa.jobs).filter(j => j.fingerprint === fp).sort((a, b) => a.created.localeCompare(b.created)).map(pub).map(({ votes, ...r }) => ({ ...r, keyWrap: undefined, walletRecovery: !!r.keyWrap, votes: votes.length, meta: { type: r.meta.type, pages: r.meta.pages, bytes: r.meta.bytes } }));
       return out(200, { ok: true, fingerprint: fp, found: seals.length > 0, seals });
     }
-    const m = url.match(/^\/api\/rwa\/jobs\/([0-9a-f]{12})(\/vote|\/keywrap)?$/);
+    const m = url.match(/^\/api\/rwa\/jobs\/([0-9a-f]{12})(\/vote|\/keywrap|\/receipt-retry)?$/);
     if (req.method === 'GET' && m && !m[2]) {
       const j = rwa.jobs[m[1]]; if (!j) return out(404, { ok: false, error: 'no such job' });
       const r = pub(j);
       if (qs.get('full') === '1' && j.ctFile) r.ciphertextB64 = fs.readFileSync(`${RWA_DIR}/${j.ctFile}`, 'utf8');
       return out(200, { ok: true, job: r });
+    }
+    if (m && m[2] === '/receipt-retry' && (req.method === 'POST' || req.method === 'GET')) {
+      try { return out(200, rwaReceiptRetry(m[1])); } catch (e) { return out(400, { ok: false, error: String(e.message || e) }); }
     }
     if (req.method !== 'POST' || !(url === '/api/rwa/jobs' || (m && m[2]))) return out(404, { ok: false, error: 'not found' });
     let b = '', big = false;
@@ -192,7 +215,12 @@ http.createServer((req, res) => {
     req.on('end', () => {
       if (big) return;
       let c; try { c = JSON.parse(b); } catch { return out(400, { ok: false, error: 'bad json' }); }
-      try { out(200, m ? (m[2] === '/keywrap' ? rwaKeyWrap(m[1], c) : rwaVote(m[1], c)) : rwaCreate(c)); } catch (e) { out(400, { ok: false, error: String(e.message || e) }); }
+      try {
+        if (!m) out(200, rwaCreate(c));
+        else if (m[2] === '/keywrap') out(200, rwaKeyWrap(m[1], c));
+        else if (m[2] === '/receipt-retry') out(200, rwaReceiptRetry(m[1]));
+        else out(200, rwaVote(m[1], c));
+      } catch (e) { out(400, { ok: false, error: String(e.message || e) }); }
     });
     return;
   }

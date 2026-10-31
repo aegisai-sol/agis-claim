@@ -3,7 +3,7 @@ import { Connection, Keypair, clusterApiUrl } from '@solana/web3.js';
 export const SUPPLY = 1_000_000_000n;
 export const DECIMALS = Number(process.env.AGIS_DECIMALS ?? 9);
 export function cluster() {
-  if (process.env.MAINNET === '1') return { name: 'mainnet-beta', url: process.env.SOLANA_RPC || clusterApiUrl('mainnet-beta') };
+  if (process.env.MAINNET === '1') return { name: 'mainnet-beta', url: process.env.SOLANA_RPC || process.env.HELIUS_RPC || 'https://solana-rpc.publicnode.com' };
   return { name: 'devnet', url: process.env.SOLANA_RPC || 'https://solana-devnet.api.onfinality.io/public' };
 }
 export function connection() { return new Connection(cluster().url, 'confirmed'); }
