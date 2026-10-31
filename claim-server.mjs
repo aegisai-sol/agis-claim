@@ -79,6 +79,11 @@ http.createServer((req, res) => {
   if (req.method === 'OPTIONS') return out(204, {});
   const url = req.url.split('?')[0];
   if (req.method === 'GET' && (url === '/' || url === '/api/health')) return out(200, { ok: true, mint: MINT.toBase58(), live: true });
+  if (req.method === 'GET' && url === '/api/supply') {
+    return Promise.all([conn.getTokenSupply(MINT), conn.getSlot().catch(() => null)])
+      .then(([s, slot]) => out(200, { ok: true, mint: MINT.toBase58(), supply: s.value.amount, uiAmount: s.value.uiAmount, uiAmountString: s.value.uiAmountString, decimals: s.value.decimals, slot }))
+      .catch(e => out(502, { ok: false, error: String(e) }));
+  }
   if (req.method !== 'POST' || url !== '/api/claim') return out(404, { ok: false, error: 'not found' });
   const ip = String(req.headers['x-forwarded-for'] || req.socket.remoteAddress).split(',')[0].trim();
   if (limited('ip:' + ip, 10, 60e3)) return out(429, { ok: false, error: 'rate limited' });
