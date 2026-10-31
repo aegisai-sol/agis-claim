@@ -54,10 +54,14 @@ const rwaSave = () => fs.writeFileSync(RWA_INDEX, JSON.stringify(rwa, null, 1));
 const pub = j => ({ receiptTx: j.receiptTx ?? null, receiptError: j.receiptError ?? null, receiptAt: j.receiptAt ?? null, id: j.id, fingerprint: j.fingerprint, meta: j.meta, status: j.status, created: j.created, rewardEstimate: j.rewardEstimate ?? null, hasCiphertext: !!j.ctFile, votes: (j.votes || []).map(v => ({ wallet: v.wallet, ok: v.ok, checks: v.checks, at: v.at })) });
 function rwaCreate(b) {
   if (!b || typeof b.fingerprint !== 'string' || !/^[0-9a-f]{64}$/i.test(b.fingerprint)) throw 'fingerprint must be sha256 hex';
+  // Privacy: we never accept or store decryption keys. Reject any key-like field.
+  const bad = k => /key|secret|password|plain/i.test(k);
+  if (Object.keys(b).some(bad) || Object.keys(b.meta || {}).some(bad)) throw 'key fields are never accepted';
   const m = b.meta || {};
   const meta = { type: String(m.type || 'doc').slice(0, 24), pages: Math.max(1, Math.min(10000, Number(m.pages) || 1)) };
   if (m.name) meta.name = String(m.name).slice(0, 120);
   if (m.iv) meta.iv = String(m.iv).slice(0, 64);
+  if (m.enc) meta.enc = String(m.enc).slice(0, 24);
   if (m.bytes) meta.bytes = Number(m.bytes) || 0;
   const id = crypto.randomBytes(6).toString('hex'), created = new Date().toISOString();
   const j = { id, fingerprint: b.fingerprint.toLowerCase(), meta, status: 'open', created, rewardEstimate: Number(b.rewardEstimate) || null, votes: [] };
