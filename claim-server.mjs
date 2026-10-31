@@ -145,12 +145,36 @@ async function houseEcoReward(id) {
     const j = rwa.jobs[id];
     if (!j) return;
     if (j.houseEcoTx) { delete j.houseEcoPending; rwaSave(); return; }
+    // Salvage prior false-negative (publicnode blockhash expiry while mint finalized)
+    const maybePrev = sigFromErr(j.houseEcoError || '');
+    if (maybePrev && await waitSigLanded(maybePrev).catch(() => false)) {
+      j.houseEcoTx = maybePrev;
+      j.houseEcoAmount = Number(HOUSE_REWARD_RAW) / 10 ** DECIMALS;
+      j.houseEcoTo = ECO_WALLET.toBase58();
+      j.houseEcoError = null;
+      delete j.houseEcoPending; rwaSave();
+      console.log(new Date().toISOString(), 'house→eco salvaged', id, maybePrev);
+      return;
+    }
     try {
       const kp = getPayer();
       const bal = await conn.getBalance(kp.publicKey, 'confirmed');
       if (bal < MIN_SOL_LAMPORTS) throw new Error('low SOL for house eco mint');
       const ata = await getOrCreateAssociatedTokenAccount(conn, kp, MINT, ECO_WALLET);
-      const tx = await mintTo(conn, kp, MINT, ata.address, kp, HOUSE_REWARD_RAW);
+      let tx = null, lastErr = null;
+      try {
+        tx = await mintTo(conn, kp, MINT, ata.address, kp, HOUSE_REWARD_RAW);
+      } catch (e) {
+        lastErr = e;
+        const maybe = sigFromErr(e);
+        if (maybe && await waitSigLanded(maybe).catch(() => false)) tx = maybe;
+        else throw e;
+      }
+      if (tx && !(await waitSigLanded(String(tx)).catch(() => false))) {
+        // mintTo returned but confirm lag — still accept if alternate RPC shows it
+        const ok = await waitSigLanded(String(tx)).catch(() => false);
+        if (!ok) throw lastErr || new Error('house eco mint not confirmed: ' + tx);
+      }
       j.houseEcoTx = String(tx);
       j.houseEcoAmount = Number(HOUSE_REWARD_RAW) / 10 ** DECIMALS;
       j.houseEcoTo = ECO_WALLET.toBase58();
@@ -159,10 +183,19 @@ async function houseEcoReward(id) {
       rwaSave();
       console.log(new Date().toISOString(), 'house→eco', id, j.houseEcoAmount, tx);
     } catch (e) {
-      j.houseEcoError = String(e.message || e).slice(0, 200);
+      const maybe = sigFromErr(e);
+      if (maybe && await waitSigLanded(maybe).catch(() => false)) {
+        j.houseEcoTx = maybe;
+        j.houseEcoAmount = Number(HOUSE_REWARD_RAW) / 10 ** DECIMALS;
+        j.houseEcoTo = ECO_WALLET.toBase58();
+        j.houseEcoError = null;
+        console.log(new Date().toISOString(), 'house→eco salvaged-err', id, maybe);
+      } else {
+        j.houseEcoError = String(e.message || e).slice(0, 200);
+        console.warn('houseEcoReward', id, j.houseEcoError);
+      }
       delete j.houseEcoPending;
       rwaSave();
-      console.warn('houseEcoReward', id, j.houseEcoError);
     }
   }).catch(e => console.warn('houseEcoReward queue', id, e));
 }
@@ -320,12 +353,28 @@ http.createServer((req, res) => {
       const seals = Object.values(rwa.jobs).filter(j => j.fingerprint === fp).sort((a, b) => a.created.localeCompare(b.created)).map(pub).map(({ votes, ...r }) => ({ ...r, keyWrap: undefined, walletRecovery: !!r.keyWrap, votes: votes.length, meta: { type: r.meta.type, pages: r.meta.pages, bytes: r.meta.bytes } }));
       return out(200, { ok: true, fingerprint: fp, found: seals.length > 0, seals });
     }
-    const m = url.match(/^\/api\/rwa\/jobs\/([0-9a-f]{12})(\/vote|\/keywrap|\/receipt-retry|\/chain)?$/);
+    const m = url.match(/^\/api\/rwa\/jobs\/([0-9a-f]{12})(\/vote|\/keywrap|\/receipt-retry|\/chain|\/house-eco-retry)?$/);
     if (req.method === 'GET' && m && !m[2]) {
       const j = rwa.jobs[m[1]]; if (!j) return out(404, { ok: false, error: 'no such job' });
       const r = pub(j);
       if (qs.get('full') === '1' && j.ctFile) r.ciphertextB64 = fs.readFileSync(`${RWA_DIR}/${j.ctFile}`, 'utf8');
       return out(200, { ok: true, job: r });
+    }
+    if ((req.method === 'POST' || req.method === 'GET') && m && m[2] === '/house-eco-retry') {
+      const j = rwa.jobs[m[1]]; if (!j) return out(404, { ok: false, error: 'no such job' });
+      if (j.houseEcoTx) return out(200, { ok: true, id: j.id, houseEcoTx: j.houseEcoTx, reused: true });
+      const maybe = sigFromErr(j.houseEcoError || '');
+      return (async () => {
+        if (maybe && await waitSigLanded(maybe).catch(() => false)) {
+          j.houseEcoTx = maybe;
+          j.houseEcoAmount = Number(HOUSE_REWARD_RAW) / 10 ** DECIMALS;
+          j.houseEcoTo = ECO_WALLET.toBase58();
+          j.houseEcoError = null; rwaSave();
+          return out(200, { ok: true, id: j.id, houseEcoTx: maybe, salvaged: true });
+        }
+        delete j.houseEcoPending; houseEcoReward(j.id);
+        return out(200, { ok: true, id: j.id, retried: true });
+      })().catch(e => out(400, { ok: false, error: String(e.message || e) }));
     }
     if (req.method === 'GET' && m && m[2] === '/chain') {
       const j = rwa.jobs[m[1]]; if (!j) return out(404, { ok: false, error: 'no such job' });
