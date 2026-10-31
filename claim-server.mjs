@@ -11,6 +11,8 @@ import { getOrCreateAssociatedTokenAccount, mintTo } from '@solana/spl-token';
 import { connection, loadKeypair, DECIMALS } from './common.mjs';
 import { computeClaim, FREE_WALLETS, deviceTier, capUnits } from './mine-rules.mjs';
 import { memoFromLogs, checkAnchorMemo, buildAnchorMemo } from './rwa-receipt.mjs';
+import { loadSigner, attest, ATTEST_ALG } from './attest.mjs';
+let ATTEST = null; try { ATTEST = loadSigner(); } catch (e) { console.error('attestation key invalid:', e.message); }
 
 const MINT = new PublicKey('GhSiU95vtKwn7FBAW1u5krxYP2PnpFPotb1LJFZkbzhW');
 const GENESIS = Number(process.env.AGIS_GENESIS || Date.parse('2026-10-31T00:00:00Z') / 1000);
@@ -75,7 +77,7 @@ const HOUSE_REWARD_RAW = BigInt(Math.max(0, Math.floor(HOUSE_REWARD_AGIS * 10 **
 fs.mkdirSync(RWA_DIR, { recursive: true });
 const rwa = fs.existsSync(RWA_INDEX) ? JSON.parse(fs.readFileSync(RWA_INDEX, 'utf8')) : { jobs: {} };
 const rwaSave = () => fs.writeFileSync(RWA_INDEX, JSON.stringify(rwa, null, 1));
-const pub = j => { const vu = j.validUntil || null; const expired = !!(vu && Date.parse(vu) < Date.now()); return ({ receiptTx: j.receiptTx ?? null, receiptError: j.receiptError ?? null, receiptAt: j.receiptAt ?? null, id: j.id, fingerprint: j.fingerprint, meta: j.meta, status: j.status, created: j.created, validUntil: vu, expired, rewardEstimate: j.rewardEstimate ?? null, hasCiphertext: !!j.ctFile, keyWrap: j.keyWrap ?? null, wrapWallet: j.wrapWallet ?? null, wrapAlg: j.wrapAlg ?? null, votes: (j.votes || []).map(v => ({ wallet: v.wallet, ok: v.ok, checks: v.checks, at: v.at })), houseEcoTx: j.houseEcoTx ?? null, houseEcoAmount: j.houseEcoAmount ?? null, houseEcoTo: j.houseEcoTo ?? null, houseEcoError: j.houseEcoError ?? null, anchorNeeded: !j.receiptTx, anchorMemo: j.receiptTx ? null : buildAnchorMemo(j), anchoredBy: j.anchoredBy ?? null }); };
+const pub = j => { const vu = j.validUntil || null; const expired = !!(vu && Date.parse(vu) < Date.now()); return ({ receiptTx: j.receiptTx ?? null, receiptError: j.receiptError ?? null, receiptAt: j.receiptAt ?? null, id: j.id, fingerprint: j.fingerprint, meta: j.meta, status: j.status, created: j.created, validUntil: vu, expired, rewardEstimate: j.rewardEstimate ?? null, hasCiphertext: !!j.ctFile, keyWrap: j.keyWrap ?? null, wrapWallet: j.wrapWallet ?? null, wrapAlg: j.wrapAlg ?? null, votes: (j.votes || []).map(v => ({ wallet: v.wallet, ok: v.ok, checks: v.checks, at: v.at })), houseEcoTx: j.houseEcoTx ?? null, houseEcoAmount: j.houseEcoAmount ?? null, houseEcoTo: j.houseEcoTo ?? null, houseEcoError: j.houseEcoError ?? null, anchorNeeded: !j.receiptTx, anchorMemo: j.receiptTx ? null : buildAnchorMemo(j), anchoredBy: j.anchoredBy ?? null, attestation: attest(j, ATTEST) }); };
 function rwaCreate(b) {
   if (!b || typeof b.fingerprint !== 'string' || !/^[0-9a-f]{64}$/i.test(b.fingerprint)) throw 'fingerprint must be sha256 hex';
   // Privacy: we never accept or store decryption keys. Reject any key-like field.
@@ -296,6 +298,7 @@ http.createServer((req, res) => {
   if (url.startsWith('/api/rwa')) {
     const qs = new URLSearchParams(req.url.split('?')[1] || '');
     if (limited('rwa:' + ip, req.method === 'GET' ? 120 : 20, 60e3)) return out(429, { ok: false, error: 'rate limited' });
+    if (req.method === 'GET' && (url === '/api/rwa/card-key' || url === '/api/attestation/pubkey')) return out(ATTEST ? 200 : 503, { ok: !!ATTEST, alg: ATTEST_ALG, keyAlg: 'ed25519', publicKey: ATTEST ? ATTEST.publicKey : null, encoding: 'base58', note: 'AGIS network attestation key. Not a government, eIDAS or notary signature.' });
     if (req.method === 'GET' && url === '/api/rwa/health') return out(200, { ok: true, rwa: true, jobs: Object.keys(rwa.jobs).length, open: Object.values(rwa.jobs).filter(j => j.status === 'open').length });
     if (req.method === 'GET' && url === '/api/rwa/jobs') {
       const st = qs.get('status') || 'open';

@@ -1,0 +1,13 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import bs58 from 'bs58';
+import nacl from 'tweetnacl';
+import { loadSigner, attest, verifyAttestation } from '../attest.mjs';
+const seed = bs58.encode(nacl.randomBytes(32));
+const s = loadSigner(seed);
+const job = { id: 'abcdef012345', fingerprint: 'a'.repeat(64), receiptTx: '5'.repeat(88), status: 'verified', created: '2026-10-31T10:00:00Z', validUntil: null, anchoredBy: 'W', receiptAt: '2026-10-31T10:01:00Z' };
+test('sign + verify', () => { const a = attest(job, s); assert.equal(a.status, 'signed'); assert.ok(verifyAttestation(a)); });
+test('tamper fails', () => { const a = attest(job, s); assert.ok(!verifyAttestation({ ...a, message: a.message.replace('verified', 'rejected') })); assert.ok(!verifyAttestation({ ...a, fields: { ...a.fields, status: 'rejected' } })); });
+test('wrong key fails', () => { const a = attest(job, s); assert.ok(!verifyAttestation({ ...a, publicKey: loadSigner(bs58.encode(nacl.randomBytes(32))).publicKey })); });
+test('64-byte secret same pubkey', () => { const kp = nacl.sign.keyPair.fromSeed(bs58.decode(seed)); assert.equal(loadSigner(bs58.encode(kp.secretKey)).publicKey, s.publicKey); });
+test('pending / unavailable', () => { assert.equal(attest({ ...job, receiptTx: null }, s).status, 'pending'); assert.equal(attest(job, null).status, 'unavailable'); });
