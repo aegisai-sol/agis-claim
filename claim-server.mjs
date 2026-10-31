@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import http from 'node:http';
 import crypto from 'node:crypto';
 import bs58 from 'bs58';
-import { PublicKey } from '@solana/web3.js';
+import { PublicKey, Transaction, TransactionInstruction, sendAndConfirmTransaction } from '@solana/web3.js';
 import { getOrCreateAssociatedTokenAccount, mintTo } from '@solana/spl-token';
 import { connection, loadKeypair, DECIMALS } from './common.mjs';
 
@@ -41,7 +41,9 @@ const limited = (k, n, ms) => { const now = Date.now(), a = (hits.get(k) || []).
 let queue = Promise.resolve(); // serialize mints
 
 // ---- RWA jobs API v1 (document verification; miners see ciphertext + hash only) ----
-// TODO(next): Solana memo receipt on verdict, fee burn, external encrypted storage/CDN.
+// On verdict: Solana Memo receipt (AEGIS/rwa/v1|id|fp|status) from payer key; never blocks the vote.
+const MEMO_PROGRAM = new PublicKey('MemoSq4gqABAXKb96qnH8TuFvNy9CtaxGCzhuB7FF6Q');
+const RWA_MEMO = process.env.RWA_MEMO !== '0';
 const RWA_DIR = process.env.RWA_DIR || './deployments/rwa-jobs';
 const RWA_INDEX = RWA_DIR + '/index.json';
 const RWA_MAX_BODY = 4 * 1024 * 1024;
@@ -49,7 +51,7 @@ const RWA_VOTES_NEEDED = Number(process.env.RWA_VOTES || 1);
 fs.mkdirSync(RWA_DIR, { recursive: true });
 const rwa = fs.existsSync(RWA_INDEX) ? JSON.parse(fs.readFileSync(RWA_INDEX, 'utf8')) : { jobs: {} };
 const rwaSave = () => fs.writeFileSync(RWA_INDEX, JSON.stringify(rwa, null, 1));
-const pub = j => ({ id: j.id, fingerprint: j.fingerprint, meta: j.meta, status: j.status, created: j.created, rewardEstimate: j.rewardEstimate ?? null, hasCiphertext: !!j.ctFile, votes: (j.votes || []).map(v => ({ wallet: v.wallet, ok: v.ok, checks: v.checks, at: v.at })) });
+const pub = j => ({ receiptTx: j.receiptTx ?? null, receiptError: j.receiptError ?? null, receiptAt: j.receiptAt ?? null, id: j.id, fingerprint: j.fingerprint, meta: j.meta, status: j.status, created: j.created, rewardEstimate: j.rewardEstimate ?? null, hasCiphertext: !!j.ctFile, votes: (j.votes || []).map(v => ({ wallet: v.wallet, ok: v.ok, checks: v.checks, at: v.at })) });
 function rwaCreate(b) {
   if (!b || typeof b.fingerprint !== 'string' || !/^[0-9a-f]{64}$/i.test(b.fingerprint)) throw 'fingerprint must be sha256 hex';
   const m = b.meta || {};
@@ -77,8 +79,25 @@ function rwaVote(id, v) {
   if (j.votes.some(x => x.wallet === w)) throw 'already voted';
   const ok = !!v.result.ok, checks = Array.isArray(v.result.checks) ? v.result.checks.slice(0, 20).map(c => String(c).slice(0, 80)) : [];
   j.votes.push({ wallet: w, ok, checks, sig: v.sig, at: new Date().toISOString() });
-  if (j.votes.length >= RWA_VOTES_NEEDED) { const yes = j.votes.filter(x => x.ok).length; j.status = yes * 2 > j.votes.length ? 'verified' : 'failed'; }
+  if (j.votes.length >= RWA_VOTES_NEEDED) { const yes = j.votes.filter(x => x.ok).length; j.status = yes * 2 > j.votes.length ? 'verified' : 'failed'; rwaReceipt(j); }
   rwaSave(); return { ok: true, id, status: j.status, votes: j.votes.length };
+}
+
+function rwaReceipt(j) {
+  if (j.receiptTx || j.receiptPending) return;
+  if (!RWA_MEMO) { j.receiptTx = null; j.receiptError = 'memo disabled'; return; }
+  j.receiptPending = true;
+  queue = queue.then(async () => {
+    try {
+      const kp = getPayer();
+      const bal = await conn.getBalance(kp.publicKey);
+      if (bal < MIN_SOL_LAMPORTS) throw new Error('low SOL on payer (' + bal + ' lamports)');
+      const memo = `AEGIS/rwa/v1|${j.id}|${j.fingerprint}|${j.status}`;
+      const tx = new Transaction().add(new TransactionInstruction({ programId: MEMO_PROGRAM, keys: [{ pubkey: kp.publicKey, isSigner: true, isWritable: false }], data: Buffer.from(memo, 'utf8') }));
+      j.receiptTx = await sendAndConfirmTransaction(conn, tx, [kp], { commitment: 'confirmed' }); j.receiptError = null;
+    } catch (e) { j.receiptTx = null; j.receiptError = String(e.message || e).slice(0, 160); }
+    j.receiptAt = new Date().toISOString(); delete j.receiptPending; rwaSave();
+  }).catch(() => {});
 }
 
 async function handle(c) {

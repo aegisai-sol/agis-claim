@@ -17,4 +17,5 @@ const msg = `AEGIS/rwa-vote/v1|${wallet}|${id}|${fp}|${new Date().toISOString()}
 const sig = crypto.sign(null, Buffer.from(msg), privateKey).toString('base64');
 [s, d] = await post(B + `/jobs/${id}/vote`, { wallet, msg, sig, result: { ok: true, checks: ['fingerprint:ok'] } }); ok(d.status === 'verified', 'vote -> verified');
 [s, d] = await post(B + `/jobs/${id}/vote`, { wallet, msg, sig, result: { ok: true } }); ok(s === 400, 'no double vote');
+await new Promise(r => setTimeout(r, 2500)); [s, d] = await j(B + '/jobs/' + id); ok('receiptTx' in d.job && (d.job.receiptTx || d.job.receiptError), 'receipt field: ' + (d.job.receiptTx || d.job.receiptError));
 console.log('ALL PASS');
