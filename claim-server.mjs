@@ -9,11 +9,10 @@ import nacl from 'tweetnacl';
 import { Connection, PublicKey, Transaction, TransactionInstruction, sendAndConfirmTransaction } from '@solana/web3.js';
 import { getOrCreateAssociatedTokenAccount, mintTo } from '@solana/spl-token';
 import { connection, loadKeypair, DECIMALS } from './common.mjs';
+import { computeClaim, FREE_WALLETS } from './mine-rules.mjs';
 
 const MINT = new PublicKey('GhSiU95vtKwn7FBAW1u5krxYP2PnpFPotb1LJFZkbzhW');
 const GENESIS = Number(process.env.AGIS_GENESIS || Date.parse('2026-10-31T00:00:00Z') / 1000);
-const ERA = 2 * 365 * 24 * 3600;
-const RATE0 = (8_500_000_000n * 10n ** 9n / 2n) / BigInt(ERA);
 const UNIT_BPS = BigInt(process.env.UNIT_BPS || 1);
 const DAILY_CAP = BigInt(process.env.DAILY_CAP_AGIS || 100) * 10n ** BigInt(DECIMALS);
 const GLOBAL_DAILY_CAP = BigInt(process.env.GLOBAL_DAILY_CAP_AGIS || 100000) * 10n ** BigInt(DECIMALS);
@@ -302,22 +301,21 @@ async function handle(c) {
   if (!(tt <= now + 120e3 && now - tt < MAX_CLAIM_AGE_MS)) throw 'claim expired';
   const secs = (tt - tf) / 1000, n = Number(tasks);
   if (!(secs > 0 && Number.isInteger(n) && n > 0 && n <= secs)) throw 'implausible work (max 1 task/sec)';
-  const era = Math.floor((tf / 1000 - GENESIS) / ERA);
-  let amt = (RATE0 >> BigInt(Math.max(era, 0))) * BigInt(n) * UNIT_BPS / 10000n;
-  const day = new Date().toISOString().slice(0, 10), k = day + '|' + w, used = BigInt(ledger.day[k] || 0);
-  const gk = day + '|*', gused = BigInt(ledger.day[gk] || 0);
-  if (used + amt > DAILY_CAP) amt = DAILY_CAP - used;
-  if (gused + amt > GLOBAL_DAILY_CAP) amt = GLOBAL_DAILY_CAP - gused;
-  if (amt <= 0n) throw 'daily cap reached';
+  const day = new Date().toISOString().slice(0, 10), k = day + '|' + w, gk = day + '|*';
+  ledger.wallets = ledger.wallets || {};
+  const r = computeClaim({ tasks: n, fromSec: tf / 1000, genesisSec: GENESIS, unitBps: UNIT_BPS, wallet: w, day, ledgerDay: ledger.day, dayWallets: ledger.wallets[day] || [], dailyCap: DAILY_CAP, globalCap: GLOBAL_DAILY_CAP, free: Number(process.env.FREE_WALLETS || FREE_WALLETS) });
+  if (!r.ok) throw r.error;
+  const { amount: amt, used, gused } = r;
   if ((await conn.getBalance(getPayer().publicKey)) < MIN_SOL_LAMPORTS) throw 'payout wallet low on SOL, try later';
   ledger.seen[dg] = 'pending'; save();
   try {
     const ata = await getOrCreateAssociatedTokenAccount(conn, getPayer(), MINT, new PublicKey(w));
     const tx = await mintTo(conn, getPayer(), MINT, ata.address, getPayer(), amt);
     ledger.seen[dg] = tx; ledger.seen['sig:' + c.sig] = tx;
-    ledger.day[k] = String(used + amt); ledger.day[gk] = String(gused + amt); save();
+    ledger.day[k] = String(used + amt); ledger.day[gk] = String(gused + amt);
+    if (!(ledger.wallets[day] || []).includes(w)) (ledger.wallets[day] = ledger.wallets[day] || []).push(w); save();
     console.log(new Date().toISOString(), 'minted', w, Number(amt) / 10 ** DECIMALS, tx);
-    return { ok: true, amount: Number(amt) / 10 ** DECIMALS, tx, explorer: 'https://solscan.io/tx/' + tx };
+    return { ok: true, amount: Number(amt) / 10 ** DECIMALS, era: r.era, activeWallets: r.active, difficultyBps: r.difficultyBps, tx, explorer: 'https://solscan.io/tx/' + tx };
   } catch (e) { delete ledger.seen[dg]; save(); throw 'mint failed: ' + (e.message || e); }
 }
 
