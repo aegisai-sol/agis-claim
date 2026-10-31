@@ -27,3 +27,10 @@ This is **AGIS network attestation of the seal receipt — not a government, eID
   Generate once: `node -e "import('bs58').then(b=>console.log(b.default.encode(require('crypto').randomBytes(32))))"`
 - Without the key, attestation is `unavailable` (no ephemeral key, so signatures stay stable across restarts).
 - Tests: `node --test test/attest.test.mjs`
+
+## Stake vault v1 return worker (custodial)
+`node stake/return-worker.mjs` = dry run (lists pending returns). `--send` pays ready returns.
+- Reads vault + vault-ATA history; FIFO unstake requests capped by stake−returned; pays after LOCK_DAYS (7) from the unstake tx blockTime.
+- Memo `AEGIS/return/v1|wallet|amount|ts|unstakeSig` (token.html ledger compatible); skips any unstake already returned (idempotent).
+- Fees paid by vault; stops if vault SOL < MIN_SOL (0.005). Never touches mint authority.
+- Render Cron Job: same repo/Dockerfile, command `node stake/return-worker.mjs --send`, schedule `0 * * * *`, env `MAINNET=1`, `SOLANA_RPC`, secret `STAKE_VAULT_JSON` (JSON array secret key — never commit).
