@@ -111,16 +111,40 @@ function rwaReceipt(j) {
       const kp = getPayer();
       const bal = await conn.getBalance(kp.publicKey, 'confirmed');
       if (bal < MIN_SOL_LAMPORTS) throw new Error('low SOL on payer (' + bal + ' lamports · ' + kp.publicKey.toBase58().slice(0, 8) + '…)');
-      const memo = `AEGIS/rwa/v1|${j.id}|${j.fingerprint}|${j.status}`;
-      const { blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash('confirmed');
-      const tx = new Transaction({ feePayer: kp.publicKey, blockhash, lastValidBlockHeight }).add(
-        new TransactionInstruction({ programId: MEMO_PROGRAM, keys: [{ pubkey: kp.publicKey, isSigner: true, isWritable: false }], data: Buffer.from(memo, 'utf8') })
-      );
-      tx.sign(kp);
-      const sig = await conn.sendRawTransaction(tx.serialize(), { skipPreflight: false, preflightCommitment: 'confirmed', maxRetries: 3 });
-      try { await conn.confirmTransaction({ signature: sig, blockhash, lastValidBlockHeight }, 'confirmed'); }
-      catch (ce) { const st = (await conn.getSignatureStatuses([sig], { searchTransactionHistory: true })).value[0]; if (!st || st.err) throw ce; }
-      j.receiptTx = sig; j.receiptError = null;
+      // Timestamped seal receipt on Solana L1 (immutable hash+time+verdict). Not an eIDAS qualified notary.
+      const sealedAt = j.created || new Date().toISOString();
+      const memo = `AEGIS/rwa/v1|${j.id}|${j.fingerprint}|${j.status}|${sealedAt}`;
+      let lastErr;
+      for (let attempt = 0; attempt < 4; attempt++) {
+        try {
+          const { blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash('finalized');
+          const tx = new Transaction({ feePayer: kp.publicKey, recentBlockhash: blockhash, lastValidBlockHeight }).add(
+            new TransactionInstruction({ programId: MEMO_PROGRAM, keys: [{ pubkey: kp.publicKey, isSigner: true, isWritable: false }], data: Buffer.from(memo, 'utf8') })
+          );
+          const sig = await sendAndConfirmTransaction(conn, tx, [kp], {
+            commitment: 'confirmed',
+            preflightCommitment: 'confirmed',
+            skipPreflight: false,
+            maxRetries: 5,
+          });
+          j.receiptTx = sig; j.receiptError = null; lastErr = null; break;
+        } catch (e) {
+          lastErr = e;
+          const msg = String(e.message || e);
+          // If signature landed despite confirm timeout, treat as success
+          const m = msg.match(/([1-9A-HJ-NP-Za-km-z]{64,88})/);
+          if (m) {
+            try {
+              const st = (await conn.getSignatureStatuses([m[1]], { searchTransactionHistory: true })).value[0];
+              if (st && !st.err && (st.confirmationStatus === 'confirmed' || st.confirmationStatus === 'finalized')) {
+                j.receiptTx = m[1]; j.receiptError = null; lastErr = null; break;
+              }
+            } catch {}
+          }
+          if (attempt < 3) await new Promise(r => setTimeout(r, 800 * (attempt + 1)));
+        }
+      }
+      if (lastErr) throw lastErr;
     } catch (e) {
       let msg = String(e.message || e);
       try { if (typeof e.getLogs === 'function') { const logs = await e.getLogs(); if (logs?.length) msg += ' | ' + logs.slice(0, 4).join(' · '); } } catch {}
