@@ -157,6 +157,13 @@ http.createServer((req, res) => {
       const st = qs.get('status') || 'open';
       return out(200, { ok: true, jobs: Object.values(rwa.jobs).filter(j => st === 'all' || j.status === st).sort((a, b) => b.created.localeCompare(a.created)).slice(0, 200).map(pub) });
     }
+    // Recovery: lost phone/key -> re-hash same file -> public proof by fingerprint. Public fields only, never ciphertext.
+    const fm = url.match(/^\/api\/rwa\/by-fingerprint\/([0-9a-fA-F]{64})$/) || (url === '/api/rwa/by-fingerprint' && [0, qs.get('fp') || '']);
+    if (req.method === 'GET' && fm) {
+      const fp = String(fm[1]).toLowerCase(); if (!/^[0-9a-f]{64}$/.test(fp)) return out(400, { ok: false, error: 'fp must be sha256 hex' });
+      const seals = Object.values(rwa.jobs).filter(j => j.fingerprint === fp).sort((a, b) => a.created.localeCompare(b.created)).map(pub).map(({ votes, ...r }) => ({ ...r, votes: votes.length, meta: { type: r.meta.type, pages: r.meta.pages, bytes: r.meta.bytes } }));
+      return out(200, { ok: true, fingerprint: fp, found: seals.length > 0, seals });
+    }
     const m = url.match(/^\/api\/rwa\/jobs\/([0-9a-f]{12})(\/vote)?$/);
     if (req.method === 'GET' && m && !m[2]) {
       const j = rwa.jobs[m[1]]; if (!j) return out(404, { ok: false, error: 'no such job' });
