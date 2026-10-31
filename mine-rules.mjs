@@ -36,3 +36,30 @@ export function computeClaim({ tasks, fromSec, genesisSec, unitBps, wallet, day,
   if (amt <= 0n) return { ok: false, error: 'daily cap reached', era, active, difficultyBps: Number(dbps) };
   return { ok: true, amount: amt, era, active, difficultyBps: Number(dbps), used, gused };
 }
+
+// ---- Device tier lock (claim msg v1 + optional device fields) ----
+// Signed msg: AEGIS/mine-claim/v1|wallet|units|from|to|uuid[|tier|cores|benchMs]
+// Legacy 6-field msgs are treated as tier 'phone' (k=1) = old 1 unit/sec rule.
+// units are tier-weighted work units (client adds up to k per verified task/sec).
+// Server max: maxUnits = floor(elapsedSec × k). units > 2×max → reject; units > max → clip to max.
+// Anti-spoof (SOFT-GO heuristic, not crypto proof; same thresholds as browser bench()):
+//   server needs cores>=12 && benchMs<15, else downgraded to laptop;
+//   laptop needs cores>=4 && benchMs<40, else downgraded to phone.
+export const TIER_K = { phone: 1, laptop: 2.5, server: 6 };
+export function deviceTier(tier, cores, benchMs) {
+  if (tier === undefined || tier === '') return { tier: 'phone', k: 1, downgraded: false, legacy: true };
+  if (!(tier in TIER_K)) throw new Error('unknown tier');
+  const c = Number(cores), ms = Number(benchMs);
+  if (!(Number.isInteger(c) && c > 0 && c <= 1024 && Number.isFinite(ms) && ms > 0 && ms < 1e5)) throw new Error('bad device fields');
+  let t = tier;
+  if (t === 'server' && !(c >= 12 && ms < 15)) t = 'laptop';
+  if (t === 'laptop' && !(c >= 4 && ms < 40)) t = 'phone';
+  return { tier: t, k: TIER_K[t], downgraded: t !== tier, legacy: false };
+}
+export function capUnits(units, secs, k) {
+  if (!(Number.isInteger(units) && units > 0 && secs > 0)) throw new Error('bad units');
+  const max = Math.floor(secs * k);
+  if (max < 1) throw new Error('implausible work');
+  if (units > 2 * max) throw new Error('implausible work (units > 2x tier max)');
+  return { units: Math.min(units, max), max, clipped: units > max };
+}

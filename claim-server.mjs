@@ -9,7 +9,7 @@ import nacl from 'tweetnacl';
 import { Connection, PublicKey, Transaction, TransactionInstruction, sendAndConfirmTransaction } from '@solana/web3.js';
 import { getOrCreateAssociatedTokenAccount, mintTo } from '@solana/spl-token';
 import { connection, loadKeypair, DECIMALS } from './common.mjs';
-import { computeClaim, FREE_WALLETS } from './mine-rules.mjs';
+import { computeClaim, FREE_WALLETS, deviceTier, capUnits } from './mine-rules.mjs';
 
 const MINT = new PublicKey('GhSiU95vtKwn7FBAW1u5krxYP2PnpFPotb1LJFZkbzhW');
 const GENESIS = Number(process.env.AGIS_GENESIS || Date.parse('2026-10-31T00:00:00Z') / 1000);
@@ -292,15 +292,16 @@ async function rwaReceiptRetry(id) {
 async function handle(c) {
   if (!c || typeof c.wallet !== 'string' || typeof c.msg !== 'string' || typeof c.sig !== 'string') throw 'bad body';
   if (c.msg.length > 300) throw 'bad message';
-  const [dom, w, tasks, from, to, dg] = c.msg.split('|');
+  const [dom, w, tasks, from, to, dg, dtier, dcores, dms] = c.msg.split('|');
   if (dom !== 'AEGIS/mine-claim/v1' || w !== c.wallet || !dg) throw 'bad message';
   new PublicKey(w);
   if (!verify(c.wallet, c.msg, c.sig)) throw 'bad signature';
   if (ledger.seen[dg] || ledger.seen['sig:' + c.sig]) throw 'replay';
   const tf = Date.parse(from), tt = Date.parse(to), now = Date.now();
   if (!(tt <= now + 120e3 && now - tt < MAX_CLAIM_AGE_MS)) throw 'claim expired';
-  const secs = (tt - tf) / 1000, n = Number(tasks);
-  if (!(secs > 0 && Number.isInteger(n) && n > 0 && n <= secs)) throw 'implausible work (max 1 task/sec)';
+  const secs = (tt - tf) / 1000;
+  let dev, cap; try { dev = deviceTier(dtier, dcores, dms); cap = capUnits(Number(tasks), secs, dev.k); } catch (e) { throw e.message; }
+  const n = cap.units;
   const day = new Date().toISOString().slice(0, 10), k = day + '|' + w, gk = day + '|*';
   ledger.wallets = ledger.wallets || {};
   const r = computeClaim({ tasks: n, fromSec: tf / 1000, genesisSec: GENESIS, unitBps: UNIT_BPS, wallet: w, day, ledgerDay: ledger.day, dayWallets: ledger.wallets[day] || [], dailyCap: DAILY_CAP, globalCap: GLOBAL_DAILY_CAP, free: Number(process.env.FREE_WALLETS || FREE_WALLETS) });
@@ -315,7 +316,7 @@ async function handle(c) {
     ledger.day[k] = String(used + amt); ledger.day[gk] = String(gused + amt);
     if (!(ledger.wallets[day] || []).includes(w)) (ledger.wallets[day] = ledger.wallets[day] || []).push(w); save();
     console.log(new Date().toISOString(), 'minted', w, Number(amt) / 10 ** DECIMALS, tx);
-    return { ok: true, amount: Number(amt) / 10 ** DECIMALS, era: r.era, activeWallets: r.active, difficultyBps: r.difficultyBps, tx, explorer: 'https://solscan.io/tx/' + tx };
+    return { ok: true, amount: Number(amt) / 10 ** DECIMALS, units: n, unitsMax: cap.max, clipped: cap.clipped, tier: dev.tier, downgraded: dev.downgraded, era: r.era, activeWallets: r.active, difficultyBps: r.difficultyBps, tx, explorer: 'https://solscan.io/tx/' + tx };
   } catch (e) { delete ledger.seen[dg]; save(); throw 'mint failed: ' + (e.message || e); }
 }
 
