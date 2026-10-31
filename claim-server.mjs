@@ -83,7 +83,19 @@ function rwaCreate(b) {
   if (m.enc) meta.enc = String(m.enc).slice(0, 24);
   if (m.bytes) meta.bytes = Number(m.bytes) || 0;
   const id = crypto.randomBytes(6).toString('hex'), created = new Date().toISOString();
-  const j = { id, fingerprint: b.fingerprint.toLowerCase(), meta, status: 'open', created, rewardEstimate: Number(b.rewardEstimate) || null, votes: [] };
+  let validUntil = null;
+  if (b.validUntil) {
+    const vu = Date.parse(b.validUntil);
+    if (!Number.isFinite(vu)) throw 'validUntil must be ISO date';
+    if (vu < Date.now() - 60e3) throw 'validUntil in the past';
+    if (vu > Date.now() + 100 * 365 * 24 * 3600e3) throw 'validUntil max 100 years';
+    validUntil = new Date(vu).toISOString();
+  } else if (b.validForHours != null) {
+    const h = Number(b.validForHours);
+    if (!(h > 0) || h > 100 * 365 * 24) throw 'validForHours out of range';
+    validUntil = new Date(Date.now() + h * 3600e3).toISOString();
+  }
+  const j = { id, fingerprint: b.fingerprint.toLowerCase(), meta, status: 'open', created, validUntil, rewardEstimate: Number(b.rewardEstimate) || null, votes: [] };
   if (typeof b.ciphertextB64 === 'string' && b.ciphertextB64.length) {
     if (!/^[A-Za-z0-9+/=]+$/.test(b.ciphertextB64)) throw 'ciphertext must be base64';
     fs.writeFileSync(`${RWA_DIR}/${id}.b64`, b.ciphertextB64); j.ctFile = id + '.b64';
@@ -132,18 +144,28 @@ function rwaReceipt(j) {
       if (bal < MIN_SOL_LAMPORTS) throw new Error('low SOL on payer (' + bal + ' lamports · ' + kp.publicKey.toBase58().slice(0, 8) + '…)');
       // Timestamped seal receipt on Solana L1 (immutable hash+time+verdict). Not an eIDAS qualified notary.
       const sealedAt = j.created || new Date().toISOString();
-      const memo = `AEGIS/rwa/v1|${j.id}|${j.fingerprint}|${j.status}|${sealedAt}`;
+      const memo = `AEGIS/rwa/v1|${j.id}|${j.fingerprint}|${j.status}|${sealedAt}|${j.validUntil || 'forever'}`;
       let lastErr = null;
       for (let attempt = 0; attempt < 3; attempt++) {
         try {
-          const { blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash('finalized');
-          const tx = new Transaction({ feePayer: kp.publicKey, recentBlockhash: blockhash, lastValidBlockHeight }).add(
-            new TransactionInstruction({ programId: MEMO_PROGRAM, keys: [{ pubkey: kp.publicKey, isSigner: true, isWritable: false }], data: Buffer.from(memo, 'utf8') })
-          );
-          tx.sign(kp);
-          const sig = await conn.sendRawTransaction(tx.serialize(), { skipPreflight: false, preflightCommitment: 'confirmed', maxRetries: 5 });
-          const ok = await waitSigLanded(sig);
-          if (!ok) throw new Error('Signature ' + sig + ' has expired: block height exceeded');
+          const latest = await conn.getLatestBlockhash('confirmed');
+          if (!latest?.blockhash) throw new Error('no blockhash from RPC');
+          const ix = new TransactionInstruction({ programId: MEMO_PROGRAM, keys: [{ pubkey: kp.publicKey, isSigner: true, isWritable: false }], data: Buffer.from(memo, 'utf8') });
+          const tx = new Transaction();
+          tx.add(ix);
+          tx.feePayer = kp.publicKey;
+          tx.recentBlockhash = latest.blockhash;
+          if (latest.lastValidBlockHeight != null) tx.lastValidBlockHeight = latest.lastValidBlockHeight;
+          const sig = await sendAndConfirmTransaction(conn, tx, [kp], {
+            commitment: 'confirmed',
+            preflightCommitment: 'confirmed',
+            skipPreflight: false,
+            maxRetries: 8,
+          });
+          if (!(await waitSigLanded(sig))) {
+            // sendAndConfirm returned but publicnode lag — alternate RPC may still show it
+            throw new Error('Signature ' + sig + ' has expired: block height exceeded');
+          }
           j.receiptTx = sig; j.receiptError = null; lastErr = null; break;
         } catch (e) {
           lastErr = e;
