@@ -40,6 +40,47 @@ const hits = new Map(); // ip/wallet -> [timestamps]
 const limited = (k, n, ms) => { const now = Date.now(), a = (hits.get(k) || []).filter(t => now - t < ms); a.push(now); hits.set(k, a); return a.length > n; };
 let queue = Promise.resolve(); // serialize mints
 
+// ---- RWA jobs API v1 (document verification; miners see ciphertext + hash only) ----
+// TODO(next): Solana memo receipt on verdict, fee burn, external encrypted storage/CDN.
+const RWA_DIR = process.env.RWA_DIR || './deployments/rwa-jobs';
+const RWA_INDEX = RWA_DIR + '/index.json';
+const RWA_MAX_BODY = 4 * 1024 * 1024;
+const RWA_VOTES_NEEDED = Number(process.env.RWA_VOTES || 1);
+fs.mkdirSync(RWA_DIR, { recursive: true });
+const rwa = fs.existsSync(RWA_INDEX) ? JSON.parse(fs.readFileSync(RWA_INDEX, 'utf8')) : { jobs: {} };
+const rwaSave = () => fs.writeFileSync(RWA_INDEX, JSON.stringify(rwa, null, 1));
+const pub = j => ({ id: j.id, fingerprint: j.fingerprint, meta: j.meta, status: j.status, created: j.created, rewardEstimate: j.rewardEstimate ?? null, hasCiphertext: !!j.ctFile, votes: (j.votes || []).map(v => ({ wallet: v.wallet, ok: v.ok, checks: v.checks, at: v.at })) });
+function rwaCreate(b) {
+  if (!b || typeof b.fingerprint !== 'string' || !/^[0-9a-f]{64}$/i.test(b.fingerprint)) throw 'fingerprint must be sha256 hex';
+  const m = b.meta || {};
+  const meta = { type: String(m.type || 'doc').slice(0, 24), pages: Math.max(1, Math.min(10000, Number(m.pages) || 1)) };
+  if (m.name) meta.name = String(m.name).slice(0, 120);
+  if (m.iv) meta.iv = String(m.iv).slice(0, 64);
+  if (m.bytes) meta.bytes = Number(m.bytes) || 0;
+  const id = crypto.randomBytes(6).toString('hex'), created = new Date().toISOString();
+  const j = { id, fingerprint: b.fingerprint.toLowerCase(), meta, status: 'open', created, rewardEstimate: Number(b.rewardEstimate) || null, votes: [] };
+  if (typeof b.ciphertextB64 === 'string' && b.ciphertextB64.length) {
+    if (!/^[A-Za-z0-9+/=]+$/.test(b.ciphertextB64)) throw 'ciphertext must be base64';
+    fs.writeFileSync(`${RWA_DIR}/${id}.b64`, b.ciphertextB64); j.ctFile = id + '.b64';
+  }
+  rwa.jobs[id] = j; rwaSave();
+  return { ok: true, id, created };
+}
+function rwaVote(id, v) {
+  const j = rwa.jobs[id]; if (!j) throw 'no such job';
+  if (!v || typeof v.wallet !== 'string' || typeof v.msg !== 'string' || typeof v.sig !== 'string' || !v.result) throw 'bad body';
+  if (v.msg.length > 300) throw 'bad message';
+  const [dom, w, jid, fp] = v.msg.split('|'); // AEGIS/rwa-vote/v1|wallet|jobId|fingerprint|ts
+  if (dom !== 'AEGIS/rwa-vote/v1' || w !== v.wallet || jid !== id || fp !== j.fingerprint) throw 'bad message';
+  new PublicKey(w);
+  if (!verify(v.wallet, v.msg, v.sig)) throw 'bad signature';
+  if (j.votes.some(x => x.wallet === w)) throw 'already voted';
+  const ok = !!v.result.ok, checks = Array.isArray(v.result.checks) ? v.result.checks.slice(0, 20).map(c => String(c).slice(0, 80)) : [];
+  j.votes.push({ wallet: w, ok, checks, sig: v.sig, at: new Date().toISOString() });
+  if (j.votes.length >= RWA_VOTES_NEEDED) { const yes = j.votes.filter(x => x.ok).length; j.status = yes * 2 > j.votes.length ? 'verified' : 'failed'; }
+  rwaSave(); return { ok: true, id, status: j.status, votes: j.votes.length };
+}
+
 async function handle(c) {
   if (!c || typeof c.wallet !== 'string' || typeof c.msg !== 'string' || typeof c.sig !== 'string') throw 'bad body';
   if (c.msg.length > 300) throw 'bad message';
@@ -78,20 +119,44 @@ http.createServer((req, res) => {
   const out = (s, j) => { res.writeHead(s, h); res.end(JSON.stringify(j)); };
   if (req.method === 'OPTIONS') return out(204, {});
   const url = req.url.split('?')[0];
-  if (req.method === 'GET' && (url === '/' || url === '/api/health')) return out(200, { ok: true, mint: MINT.toBase58(), live: true });
+  if (req.method === 'GET' && (url === '/' || url === '/api/health')) return out(200, { ok: true, mint: MINT.toBase58(), live: true, rwa: true, jobs: Object.keys(rwa.jobs).length });
   if (req.method === 'GET' && url === '/api/supply') {
     return Promise.all([conn.getTokenSupply(MINT), conn.getSlot().catch(() => null)])
       .then(([s, slot]) => out(200, { ok: true, mint: MINT.toBase58(), supply: s.value.amount, uiAmount: s.value.uiAmount, uiAmountString: s.value.uiAmountString, decimals: s.value.decimals, slot }))
       .catch(e => out(502, { ok: false, error: String(e) }));
   }
-  if (req.method !== 'POST' || url !== '/api/claim') return out(404, { ok: false, error: 'not found' });
   const ip = String(req.headers['x-forwarded-for'] || req.socket.remoteAddress).split(',')[0].trim();
-  if (limited('ip:' + ip, 10, 60e3)) return out(429, { ok: false, error: 'rate limited' });
+  if (url.startsWith('/api/rwa')) {
+    const qs = new URLSearchParams(req.url.split('?')[1] || '');
+    if (limited('rwa:' + ip, req.method === 'GET' ? 120 : 20, 60e3)) return out(429, { ok: false, error: 'rate limited' });
+    if (req.method === 'GET' && url === '/api/rwa/health') return out(200, { ok: true, rwa: true, jobs: Object.keys(rwa.jobs).length, open: Object.values(rwa.jobs).filter(j => j.status === 'open').length });
+    if (req.method === 'GET' && url === '/api/rwa/jobs') {
+      const st = qs.get('status') || 'open';
+      return out(200, { ok: true, jobs: Object.values(rwa.jobs).filter(j => st === 'all' || j.status === st).sort((a, b) => b.created.localeCompare(a.created)).slice(0, 200).map(pub) });
+    }
+    const m = url.match(/^\/api\/rwa\/jobs\/([0-9a-f]{12})(\/vote)?$/);
+    if (req.method === 'GET' && m && !m[2]) {
+      const j = rwa.jobs[m[1]]; if (!j) return out(404, { ok: false, error: 'no such job' });
+      const r = pub(j);
+      if (qs.get('full') === '1' && j.ctFile) r.ciphertextB64 = fs.readFileSync(`${RWA_DIR}/${j.ctFile}`, 'utf8');
+      return out(200, { ok: true, job: r });
+    }
+    if (req.method !== 'POST' || !(url === '/api/rwa/jobs' || (m && m[2]))) return out(404, { ok: false, error: 'not found' });
+    let b = '', big = false;
+    req.on('data', d => { if (big) return; b += d; if (b.length > RWA_MAX_BODY) { big = true; out(413, { ok: false, error: 'body too large (max 4MB)' }); req.destroy(); } });
+    req.on('end', () => {
+      if (big) return;
+      let c; try { c = JSON.parse(b); } catch { return out(400, { ok: false, error: 'bad json' }); }
+      try { out(200, m ? rwaVote(m[1], c) : rwaCreate(c)); } catch (e) { out(400, { ok: false, error: String(e.message || e) }); }
+    });
+    return;
+  }
+  if (req.method !== 'POST' || url !== '/api/claim') return out(404, { ok: false, error: 'not found' });
   let b = ''; req.on('data', d => { b += d; if (b.length > 4096) req.destroy(); });
   req.on('end', () => {
     let c; try { c = JSON.parse(b); } catch { return out(400, { ok: false, error: 'bad json' }); }
     if (c && typeof c.wallet === 'string' && limited('w:' + c.wallet, 5, 60e3)) return out(429, { ok: false, error: 'rate limited' });
     queue = queue.then(() => handle(c)).then(r => out(200, r), e => out(400, { ok: false, error: String(e) }));
   });
-}).listen(PORT, '0.0.0.0', () => console.log('claim server on', PORT, 'payer', getPayer().publicKey.toBase58()));
+}).listen(PORT, '0.0.0.0', () => { let p = 'unset'; try { p = getPayer().publicKey.toBase58(); } catch {} console.log('claim server on', PORT, 'payer', p); });
 

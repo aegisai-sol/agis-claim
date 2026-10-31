@@ -1,0 +1,20 @@
+// Local smoke test: PORT=<free port> node scripts/claim-server.mjs & BASE=http://127.0.0.1:<port>/api/rwa node scripts/test-rwa-api.mjs
+import crypto from 'node:crypto'; import bs58 from 'bs58';
+const B = process.env.BASE || 'http://localhost:8799/api/rwa';
+const j = async (u, o) => { const r = await fetch(u, o); return [r.status, await r.json()]; };
+const post = (u, b) => j(u, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(b) });
+const ok = (c, m) => { if (!c) { console.error('FAIL', m); process.exit(1); } console.log('ok', m); };
+const fp = crypto.createHash('sha256').update('doc').digest('hex');
+let [s, d] = await j(B + '/health'); ok(s === 200 && d.rwa, 'health');
+[s, d] = await post(B + '/jobs', { fingerprint: 'xx' }); ok(s === 400, 'reject bad fingerprint');
+[s, d] = await post(B + '/jobs', { fingerprint: fp, meta: { type: 'deed', pages: 2 }, ciphertextB64: Buffer.alloc(64, 7).toString('base64') }); ok(s === 200 && d.id, 'create'); const id = d.id;
+[s, d] = await j(B + '/jobs'); ok(d.jobs.some(x => x.id === id) && !d.jobs[0].ciphertextB64, 'list no ciphertext');
+[s, d] = await j(B + '/jobs/' + id + '?full=1'); ok(d.job.ciphertextB64, 'detail full');
+const { publicKey, privateKey } = crypto.generateKeyPairSync('ed25519');
+const wallet = bs58.encode(publicKey.export({ format: 'der', type: 'spki' }).subarray(12));
+const msg = `AEGIS/rwa-vote/v1|${wallet}|${id}|${fp}|${new Date().toISOString()}`;
+[s, d] = await post(B + `/jobs/${id}/vote`, { wallet, msg, sig: Buffer.alloc(64).toString('base64'), result: { ok: true } }); ok(s === 400, 'reject bad sig');
+const sig = crypto.sign(null, Buffer.from(msg), privateKey).toString('base64');
+[s, d] = await post(B + `/jobs/${id}/vote`, { wallet, msg, sig, result: { ok: true, checks: ['fingerprint:ok'] } }); ok(d.status === 'verified', 'vote -> verified');
+[s, d] = await post(B + `/jobs/${id}/vote`, { wallet, msg, sig, result: { ok: true } }); ok(s === 400, 'no double vote');
+console.log('ALL PASS');
