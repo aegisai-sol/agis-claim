@@ -118,7 +118,8 @@ function rwaReceipt(j) {
       );
       tx.sign(kp);
       const sig = await conn.sendRawTransaction(tx.serialize(), { skipPreflight: false, preflightCommitment: 'confirmed', maxRetries: 3 });
-      await conn.confirmTransaction({ signature: sig, blockhash, lastValidBlockHeight }, 'confirmed');
+      try { await conn.confirmTransaction({ signature: sig, blockhash, lastValidBlockHeight }, 'confirmed'); }
+      catch (ce) { const st = (await conn.getSignatureStatuses([sig], { searchTransactionHistory: true })).value[0]; if (!st || st.err) throw ce; }
       j.receiptTx = sig; j.receiptError = null;
     } catch (e) {
       let msg = String(e.message || e);
