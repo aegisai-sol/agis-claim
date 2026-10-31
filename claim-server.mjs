@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import http from 'node:http';
 import crypto from 'node:crypto';
 import bs58 from 'bs58';
-import { PublicKey, Transaction, TransactionInstruction, sendAndConfirmTransaction } from '@solana/web3.js';
+import { Connection, PublicKey, Transaction, TransactionInstruction, sendAndConfirmTransaction } from '@solana/web3.js';
 import { getOrCreateAssociatedTokenAccount, mintTo } from '@solana/spl-token';
 import { connection, loadKeypair, DECIMALS } from './common.mjs';
 
@@ -31,6 +31,25 @@ fs.mkdirSync('./deployments', { recursive: true });
 const ledger = fs.existsSync(LEDGER) ? JSON.parse(fs.readFileSync(LEDGER, 'utf8')) : { seen: {}, day: {} };
 const save = () => fs.writeFileSync(LEDGER, JSON.stringify(ledger, null, 1));
 const conn = connection();
+const confirmConn = new Connection('https://api.mainnet-beta.solana.com', 'confirmed');
+async function waitSigLanded(sig) {
+  for (let i = 0; i < 30; i++) {
+    for (const c of [confirmConn, conn]) {
+      try {
+        const st = (await c.getSignatureStatuses([sig], { searchTransactionHistory: true })).value[0];
+        if (st?.err) throw new Error('tx failed on-chain: ' + JSON.stringify(st.err));
+        if (st && (st.confirmationStatus === 'confirmed' || st.confirmationStatus === 'finalized')) return true;
+      } catch (e) { if (String(e.message||e).startsWith('tx failed')) throw e; }
+    }
+    await new Promise(r => setTimeout(r, 1500));
+  }
+  return false;
+}
+function sigFromErr(e) {
+  const m = String(e && e.message || e).match(/\b([1-9A-HJ-NP-Za-km-z]{80,90})\b/);
+  return m ? m[1] : null;
+}
+
 let payer = null;
 const getPayer = () => {
   if (!payer) payer = loadKeypair();
@@ -114,49 +133,51 @@ function rwaReceipt(j) {
       // Timestamped seal receipt on Solana L1 (immutable hash+time+verdict). Not an eIDAS qualified notary.
       const sealedAt = j.created || new Date().toISOString();
       const memo = `AEGIS/rwa/v1|${j.id}|${j.fingerprint}|${j.status}|${sealedAt}`;
-      let lastErr;
-      for (let attempt = 0; attempt < 4; attempt++) {
+      let lastErr = null;
+      for (let attempt = 0; attempt < 3; attempt++) {
         try {
           const { blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash('finalized');
           const tx = new Transaction({ feePayer: kp.publicKey, recentBlockhash: blockhash, lastValidBlockHeight }).add(
             new TransactionInstruction({ programId: MEMO_PROGRAM, keys: [{ pubkey: kp.publicKey, isSigner: true, isWritable: false }], data: Buffer.from(memo, 'utf8') })
           );
-          const sig = await sendAndConfirmTransaction(conn, tx, [kp], {
-            commitment: 'confirmed',
-            preflightCommitment: 'confirmed',
-            skipPreflight: false,
-            maxRetries: 5,
-          });
+          tx.sign(kp);
+          const sig = await conn.sendRawTransaction(tx.serialize(), { skipPreflight: false, preflightCommitment: 'confirmed', maxRetries: 5 });
+          const ok = await waitSigLanded(sig);
+          if (!ok) throw new Error('Signature ' + sig + ' has expired: block height exceeded');
           j.receiptTx = sig; j.receiptError = null; lastErr = null; break;
         } catch (e) {
           lastErr = e;
-          const msg = String(e.message || e);
-          // If signature landed despite confirm timeout, treat as success
-          const m = msg.match(/([1-9A-HJ-NP-Za-km-z]{64,88})/);
-          if (m) {
-            try {
-              const st = (await conn.getSignatureStatuses([m[1]], { searchTransactionHistory: true })).value[0];
-              if (st && !st.err && (st.confirmationStatus === 'confirmed' || st.confirmationStatus === 'finalized')) {
-                j.receiptTx = m[1]; j.receiptError = null; lastErr = null; break;
-              }
-            } catch {}
+          const maybe = sigFromErr(e);
+          if (maybe && await waitSigLanded(maybe).catch(() => false)) {
+            j.receiptTx = maybe; j.receiptError = null; lastErr = null; break;
           }
-          if (attempt < 3) await new Promise(r => setTimeout(r, 800 * (attempt + 1)));
+          if (attempt < 2) await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
         }
       }
       if (lastErr) throw lastErr;
     } catch (e) {
       let msg = String(e.message || e);
-      try { if (typeof e.getLogs === 'function') { const logs = await e.getLogs(); if (logs?.length) msg += ' | ' + logs.slice(0, 4).join(' · '); } } catch {}
-      j.receiptTx = null; j.receiptError = msg.slice(0, 240);
+      // Last chance: salvage sig from error if it finalized on alternate RPC
+      const maybe = sigFromErr(e);
+      if (maybe) {
+        try {
+          if (await waitSigLanded(maybe)) { j.receiptTx = maybe; j.receiptError = null; msg = null; }
+        } catch {}
+      }
+      if (msg) { j.receiptTx = null; j.receiptError = msg.slice(0, 240); }
     }
     j.receiptAt = new Date().toISOString(); delete j.receiptPending; rwaSave();
   }).catch(() => {});
 }
-function rwaReceiptRetry(id) {
+async function rwaReceiptRetry(id) {
   const j = rwa.jobs[id]; if (!j) throw 'no such job';
   if (j.status !== 'verified' && j.status !== 'failed') throw 'not settled';
   if (j.receiptTx) return { ok: true, id, receiptTx: j.receiptTx, reused: true };
+  const maybe = sigFromErr(j.receiptError || '');
+  if (maybe && await waitSigLanded(maybe).catch(() => false)) {
+    j.receiptTx = maybe; j.receiptError = null; j.receiptAt = new Date().toISOString(); rwaSave();
+    return { ok: true, id, receiptTx: maybe, salvaged: true };
+  }
   delete j.receiptPending; j.receiptError = null; rwaReceipt(j);
   return { ok: true, id, retried: true };
 }
@@ -243,7 +264,7 @@ http.createServer((req, res) => {
       try {
         if (!m) out(200, rwaCreate(c));
         else if (m[2] === '/keywrap') out(200, rwaKeyWrap(m[1], c));
-        else if (m[2] === '/receipt-retry') out(200, rwaReceiptRetry(m[1]));
+        else if (m[2] === '/receipt-retry') return out(200, await rwaReceiptRetry(m[1]));
         else out(200, rwaVote(m[1], c));
       } catch (e) { out(400, { ok: false, error: String(e.message || e) }); }
     });
