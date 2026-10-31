@@ -253,7 +253,7 @@ http.createServer((req, res) => {
       return out(200, { ok: true, job: r });
     }
     if (m && m[2] === '/receipt-retry' && (req.method === 'POST' || req.method === 'GET')) {
-      try { return out(200, rwaReceiptRetry(m[1])); } catch (e) { return out(400, { ok: false, error: String(e.message || e) }); }
+      return rwaReceiptRetry(m[1]).then(r => out(200, r), e => out(400, { ok: false, error: String(e.message || e) }));
     }
     if (req.method !== 'POST' || !(url === '/api/rwa/jobs' || (m && m[2]))) return out(404, { ok: false, error: 'not found' });
     let b = '', big = false;
@@ -264,7 +264,7 @@ http.createServer((req, res) => {
       try {
         if (!m) out(200, rwaCreate(c));
         else if (m[2] === '/keywrap') out(200, rwaKeyWrap(m[1], c));
-        else if (m[2] === '/receipt-retry') return out(200, await rwaReceiptRetry(m[1]));
+        else if (m[2] === '/receipt-retry') return rwaReceiptRetry(m[1]).then(r => out(200, r), e => out(400, { ok: false, error: String(e.message || e) }));
         else out(200, rwaVote(m[1], c));
       } catch (e) { out(400, { ok: false, error: String(e.message || e) }); }
     });
