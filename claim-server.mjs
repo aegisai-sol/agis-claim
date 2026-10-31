@@ -70,7 +70,7 @@ const RWA_MAX_BODY = 4 * 1024 * 1024;
 const RWA_VOTES_NEEDED = Number(process.env.RWA_VOTES || 1);
 const RWA_HOUSE_VOTE_MS = Number(process.env.RWA_HOUSE_VOTE_MS || 20000); // soft-go: house miner if none vote
 const ECO_WALLET = new PublicKey(process.env.ECO_WALLET || '9DmwoF1qJ8fASDasjkE2jacrEAWuRwUnDWwJ41eQgKan');
-const HOUSE_REWARD_AGIS = Number(process.env.HOUSE_REWARD_AGIS || 0.05); // reduced rate vs public miners; recycled to eco pool
+const HOUSE_REWARD_AGIS = Number(process.env.HOUSE_REWARD_AGIS || 0.001); // upload-only soft-go stipend → eco; tiny vs public miners
 const HOUSE_REWARD_RAW = BigInt(Math.max(0, Math.floor(HOUSE_REWARD_AGIS * 10 ** DECIMALS)));
 fs.mkdirSync(RWA_DIR, { recursive: true });
 const rwa = fs.existsSync(RWA_INDEX) ? JSON.parse(fs.readFileSync(RWA_INDEX, 'utf8')) : { jobs: {} };
@@ -133,8 +133,8 @@ function houseVoteIfOpen(id) {
   const msg = `AEGIS/rwa-vote/v1|${wallet}|${id}|${j.fingerprint}|${ts}`;
   const sig = Buffer.from(nacl.sign.detached(Buffer.from(msg), kp.secretKey)).toString('base64');
   try {
-    const r = rwaVote(id, { wallet, msg, sig, result: { ok: true, checks: ['house-softgo'] } });
-    if (r && (r.status === 'verified' || r.status === 'failed')) houseEcoReward(id);
+    // Vote only — eco stipend minted once after on-chain receipt (see rwaReceipt)
+    rwaVote(id, { wallet, msg, sig, result: { ok: true, checks: ['house-softgo'] } });
   } catch (e) { /* already voted / settled */ }
 }
 async function houseEcoReward(id) {
@@ -330,7 +330,7 @@ http.createServer((req, res) => {
   const url = req.url.split('?')[0];
   if (req.method === 'GET' && (url === '/' || url === '/api/health')) {
       let payerPk = null; try { payerPk = getPayer().publicKey.toBase58(); } catch {}
-      return out(200, { ok: true, mint: MINT.toBase58(), live: true, rwa: true, jobs: Object.keys(rwa.jobs).length, houseSoftgoMs: RWA_HOUSE_VOTE_MS, houseRewardAgis: HOUSE_REWARD_AGIS, ecoWallet: ECO_WALLET.toBase58(), mainnet: process.env.MAINNET === '1', payer: payerPk ? payerPk.slice(0, 8) + '…' + payerPk.slice(-4) : null, rpc: (process.env.SOLANA_RPC || (process.env.MAINNET === '1' ? 'mainnet-default' : 'devnet')).replace(/api[_-]?key=[^&]+/ig, 'api_key=…') });
+      return out(200, { ok: true, mint: MINT.toBase58(), live: true, rwa: true, jobs: Object.keys(rwa.jobs).length, houseSoftgoMs: RWA_HOUSE_VOTE_MS, houseRewardAgis: HOUSE_REWARD_AGIS, houseMode: 'upload-only', ecoWallet: ECO_WALLET.toBase58(), mainnet: process.env.MAINNET === '1', payer: payerPk ? payerPk.slice(0, 8) + '…' + payerPk.slice(-4) : null, rpc: (process.env.SOLANA_RPC || (process.env.MAINNET === '1' ? 'mainnet-default' : 'devnet')).replace(/api[_-]?key=[^&]+/ig, 'api_key=…') });
     }
   if (req.method === 'GET' && url === '/api/supply') {
     return Promise.all([conn.getTokenSupply(MINT), conn.getSlot().catch(() => null)])
