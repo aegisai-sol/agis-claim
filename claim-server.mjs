@@ -12,6 +12,7 @@ import { connection, loadKeypair, DECIMALS } from './common.mjs';
 import { computeClaim, FREE_WALLETS, deviceTier, capUnits } from './mine-rules.mjs';
 import { memoFromLogs, checkAnchorMemo, buildAnchorMemo } from './rwa-receipt.mjs';
 import { loadSigner, attest, ATTEST_ALG } from './attest.mjs';
+import { issueBatch, parseBatch, gradeAnswers, MAX_TASKS } from './pov-tasks.mjs';
 let ATTEST = null; try { ATTEST = loadSigner(); } catch (e) { console.error('attestation key invalid:', e.message); }
 
 const MINT = new PublicKey('GhSiU95vtKwn7FBAW1u5krxYP2PnpFPotb1LJFZkbzhW');
@@ -58,6 +59,10 @@ const getPayer = () => {
   if (!payer) payer = loadKeypair();
   return payer;
 };
+// PoV-R batch secret: POV_SECRET env, else a one-way, domain-separated hash of the payout key (never exposed).
+let povSecret = null;
+const getPovSecret = () => povSecret || (povSecret = process.env.POV_SECRET ? Buffer.from(process.env.POV_SECRET) : crypto.createHash('sha256').update('agis-pov-secret/v1|').update(Buffer.from(getPayer().secretKey)).digest());
+const REQUIRE_POV = process.env.REQUIRE_POV === '1';
 const hits = new Map(); // ip/wallet -> [timestamps]
 const limited = (k, n, ms) => { const now = Date.now(), a = (hits.get(k) || []).filter(t => now - t < ms); a.push(now); hits.set(k, a); return a.length > n; };
 let queue = Promise.resolve(); // serialize mints
@@ -249,16 +254,32 @@ async function rwaReceiptRetry(id) {
 
 async function handle(c) {
   if (!c || typeof c.wallet !== 'string' || typeof c.msg !== 'string' || typeof c.sig !== 'string') throw 'bad body';
-  if (c.msg.length > 300) throw 'bad message';
-  const [dom, w, tasks, from, to, dg, dtier, dcores, dms] = c.msg.split('|');
-  if (dom !== 'AEGIS/mine-claim/v1' || w !== c.wallet || !dg) throw 'bad message';
+  if (c.msg.length > 400) throw 'bad message';
+  // v1: AEGIS/mine-claim/v1|wallet|units|from|to|uuid[|tier|cores|benchMs]  (self-reported units; legacy)
+  // v2: AEGIS/mine-claim/v2|wallet|batchId|answersHex|from|to|uuid|tier|cores|benchMs  (PoV-R graded work)
+  const parts = c.msg.split('|'), dom = parts[0], v2 = dom === 'AEGIS/mine-claim/v2';
+  if (!v2 && REQUIRE_POV) throw 'PoV-R work proof required: use GET /api/mine/tasks then claim v2';
+  const [, w, tasks, from, to, dg, dtier, dcores, dms] = v2 ? [dom, parts[1], null, parts[4], parts[5], parts[6], parts[7], parts[8], parts[9]] : parts;
+  if (!(dom === 'AEGIS/mine-claim/v1' || v2) || w !== c.wallet || !dg) throw 'bad message';
   new PublicKey(w);
   if (!verify(c.wallet, c.msg, c.sig)) throw 'bad signature';
   if (ledger.seen[dg] || ledger.seen['sig:' + c.sig]) throw 'replay';
   const tf = Date.parse(from), tt = Date.parse(to), now = Date.now();
   if (!(tt <= now + 120e3 && now - tt < MAX_CLAIM_AGE_MS)) throw 'claim expired';
   const secs = (tt - tf) / 1000;
-  let dev, cap; try { dev = deviceTier(dtier, dcores, dms); cap = capUnits(Number(tasks), secs, dev.k); } catch (e) { throw e.message; }
+  let dev, cap, pov = null; try {
+    dev = deviceTier(dtier, dcores, dms);
+    let claimed = Number(tasks);
+    if (v2) {
+      const b = parseBatch(getPovSecret(), w, parts[2], Math.floor(now / 1000));
+      if (ledger.seen['pov:' + b.tag]) throw new Error('batch already claimed');
+      if (tf < (b.iat - 5) * 1000) throw new Error('work started before batch was issued');
+      pov = { tag: b.tag, ...gradeAnswers(getPovSecret(), parts[2], parts[3]) };
+      if (!pov.pass) throw new Error(`work check failed: ${pov.correct}/${pov.n} correct`);
+      claimed = Math.floor(pov.correct * Math.min(dev.k, 2));
+    }
+    cap = capUnits(claimed, secs, dev.k);
+  } catch (e) { throw e.message || String(e); }
   const n = cap.units;
   const day = new Date().toISOString().slice(0, 10), k = day + '|' + w, gk = day + '|*';
   ledger.wallets = ledger.wallets || {};
@@ -270,11 +291,11 @@ async function handle(c) {
   try {
     const ata = await getOrCreateAssociatedTokenAccount(conn, getPayer(), MINT, new PublicKey(w));
     const tx = await mintTo(conn, getPayer(), MINT, ata.address, getPayer(), amt);
-    ledger.seen[dg] = tx; ledger.seen['sig:' + c.sig] = tx;
+    ledger.seen[dg] = tx; ledger.seen['sig:' + c.sig] = tx; if (pov) ledger.seen['pov:' + pov.tag] = tx;
     ledger.day[k] = String(used + amt); ledger.day[gk] = String(gused + amt);
     if (!(ledger.wallets[day] || []).includes(w)) (ledger.wallets[day] = ledger.wallets[day] || []).push(w); save();
     console.log(new Date().toISOString(), 'minted', w, Number(amt) / 10 ** DECIMALS, tx);
-    return { ok: true, amount: Number(amt) / 10 ** DECIMALS, units: n, unitsMax: cap.max, clipped: cap.clipped, tier: dev.tier, downgraded: dev.downgraded, era: r.era, activeWallets: r.active, difficultyBps: r.difficultyBps, tx, explorer: 'https://solscan.io/tx/' + tx };
+    return { ok: true, amount: Number(amt) / 10 ** DECIMALS, units: n, unitsMax: cap.max, clipped: cap.clipped, tier: dev.tier, downgraded: dev.downgraded, pov: pov ? { correct: pov.correct, n: pov.n } : null, era: r.era, activeWallets: r.active, difficultyBps: r.difficultyBps, tx, explorer: 'https://solscan.io/tx/' + tx };
   } catch (e) { delete ledger.seen[dg]; save(); throw 'mint failed: ' + (e.message || e); }
 }
 
@@ -383,6 +404,16 @@ http.createServer((req, res) => {
       } catch (e) { out(400, { ok: false, error: String(e.message || e) }); }
     });
     return;
+  }
+  if (req.method === 'GET' && url === '/api/mine/tasks') {
+    if (limited('pov:' + ip, 30, 60e3)) return out(429, { ok: false, error: 'rate limited' });
+    const qs = new URLSearchParams(req.url.split('?')[1] || '');
+    try {
+      const w = String(qs.get('wallet') || ''); new PublicKey(w);
+      const n = Math.min(MAX_TASKS, Math.max(1, Number(qs.get('n')) || 60));
+      const iat = Math.floor(Date.now() / 1000), b = issueBatch(getPovSecret(), w, n, iat, crypto.randomBytes(8).toString('hex'));
+      return out(200, { ok: true, domain: 'AEGIS/mine-claim/v2', batchId: b.batchId, tasks: b.tasks, issuedAt: new Date(iat * 1000).toISOString(), minAccuracy: 0.9, rules: 'a*b=c true if exact; sha256(s)^hh true if hex digest starts with hh; prime(x) true if x is prime. Answer bits MSB-first, hex.' });
+    } catch (e) { return out(400, { ok: false, error: 'bad wallet' }); }
   }
   if (req.method !== 'POST' || url !== '/api/claim') return out(404, { ok: false, error: 'not found' });
   let b = ''; req.on('data', d => { b += d; if (b.length > 4096) req.destroy(); });
