@@ -69,10 +69,13 @@ const RWA_INDEX = RWA_DIR + '/index.json';
 const RWA_MAX_BODY = 4 * 1024 * 1024;
 const RWA_VOTES_NEEDED = Number(process.env.RWA_VOTES || 1);
 const RWA_HOUSE_VOTE_MS = Number(process.env.RWA_HOUSE_VOTE_MS || 20000); // soft-go: house miner if none vote
+const ECO_WALLET = new PublicKey(process.env.ECO_WALLET || '9DmwoF1qJ8fASDasjkE2jacrEAWuRwUnDWwJ41eQgKan');
+const HOUSE_REWARD_AGIS = Number(process.env.HOUSE_REWARD_AGIS || 0.05); // reduced rate vs public miners; recycled to eco pool
+const HOUSE_REWARD_RAW = BigInt(Math.max(0, Math.floor(HOUSE_REWARD_AGIS * 10 ** DECIMALS)));
 fs.mkdirSync(RWA_DIR, { recursive: true });
 const rwa = fs.existsSync(RWA_INDEX) ? JSON.parse(fs.readFileSync(RWA_INDEX, 'utf8')) : { jobs: {} };
 const rwaSave = () => fs.writeFileSync(RWA_INDEX, JSON.stringify(rwa, null, 1));
-const pub = j => { const vu = j.validUntil || null; const expired = !!(vu && Date.parse(vu) < Date.now()); return ({ receiptTx: j.receiptTx ?? null, receiptError: j.receiptError ?? null, receiptAt: j.receiptAt ?? null, id: j.id, fingerprint: j.fingerprint, meta: j.meta, status: j.status, created: j.created, validUntil: vu, expired, rewardEstimate: j.rewardEstimate ?? null, hasCiphertext: !!j.ctFile, keyWrap: j.keyWrap ?? null, wrapWallet: j.wrapWallet ?? null, wrapAlg: j.wrapAlg ?? null, votes: (j.votes || []).map(v => ({ wallet: v.wallet, ok: v.ok, checks: v.checks, at: v.at })) }); };
+const pub = j => { const vu = j.validUntil || null; const expired = !!(vu && Date.parse(vu) < Date.now()); return ({ receiptTx: j.receiptTx ?? null, receiptError: j.receiptError ?? null, receiptAt: j.receiptAt ?? null, id: j.id, fingerprint: j.fingerprint, meta: j.meta, status: j.status, created: j.created, validUntil: vu, expired, rewardEstimate: j.rewardEstimate ?? null, hasCiphertext: !!j.ctFile, keyWrap: j.keyWrap ?? null, wrapWallet: j.wrapWallet ?? null, wrapAlg: j.wrapAlg ?? null, votes: (j.votes || []).map(v => ({ wallet: v.wallet, ok: v.ok, checks: v.checks, at: v.at })), houseEcoTx: j.houseEcoTx ?? null, houseEcoAmount: j.houseEcoAmount ?? null, houseEcoTo: j.houseEcoTo ?? null }); };
 function rwaCreate(b) {
   if (!b || typeof b.fingerprint !== 'string' || !/^[0-9a-f]{64}$/i.test(b.fingerprint)) throw 'fingerprint must be sha256 hex';
   // Privacy: we never accept or store decryption keys. Reject any key-like field.
@@ -129,10 +132,33 @@ function houseVoteIfOpen(id) {
   const ts = new Date().toISOString();
   const msg = `AEGIS/rwa-vote/v1|${wallet}|${id}|${j.fingerprint}|${ts}`;
   const sig = Buffer.from(nacl.sign.detached(Buffer.from(msg), kp.secretKey)).toString('base64');
-  // Prefer node crypto via bs58 path already in verify — sign with nacl from secretKey
   try {
-    rwaVote(id, { wallet, msg, sig, result: { ok: true, checks: ['house-softgo'] } });
+    const r = rwaVote(id, { wallet, msg, sig, result: { ok: true, checks: ['house-softgo'] } });
+    if (r && (r.status === 'verified' || r.status === 'failed')) houseEcoReward(id);
   } catch (e) { /* already voted / settled */ }
+}
+async function houseEcoReward(id) {
+  const j = rwa.jobs[id]; if (!j || j.houseEcoTx || j.houseEcoPending) return;
+  if (HOUSE_REWARD_RAW <= 0n) { j.houseEcoNote = 'house reward disabled'; rwaSave(); return; }
+  j.houseEcoPending = true; rwaSave();
+  queue = queue.then(async () => {
+    try {
+      const kp = getPayer();
+      const bal = await conn.getBalance(kp.publicKey, 'confirmed');
+      if (bal < MIN_SOL_LAMPORTS) throw new Error('low SOL for house eco mint');
+      const ata = await getOrCreateAssociatedTokenAccount(conn, kp, MINT, ECO_WALLET);
+      const tx = await mintTo(conn, kp, MINT, ata.address, kp, HOUSE_REWARD_RAW);
+      j.houseEcoTx = tx;
+      j.houseEcoAmount = Number(HOUSE_REWARD_RAW) / 10 ** DECIMALS;
+      j.houseEcoTo = ECO_WALLET.toBase58();
+      j.houseEcoError = null;
+      console.log(new Date().toISOString(), 'house→eco', id, j.houseEcoAmount, tx);
+    } catch (e) {
+      j.houseEcoError = String(e.message || e).slice(0, 200);
+      console.warn('houseEcoReward', id, j.houseEcoError);
+    }
+    delete j.houseEcoPending; rwaSave();
+  }).catch(() => {});
 }
 function rwaVote(id, v) {
   const j = rwa.jobs[id]; if (!j) throw 'no such job';
@@ -260,7 +286,7 @@ http.createServer((req, res) => {
   const url = req.url.split('?')[0];
   if (req.method === 'GET' && (url === '/' || url === '/api/health')) {
       let payerPk = null; try { payerPk = getPayer().publicKey.toBase58(); } catch {}
-      return out(200, { ok: true, mint: MINT.toBase58(), live: true, rwa: true, jobs: Object.keys(rwa.jobs).length, mainnet: process.env.MAINNET === '1', payer: payerPk ? payerPk.slice(0, 8) + '…' + payerPk.slice(-4) : null, rpc: (process.env.SOLANA_RPC || (process.env.MAINNET === '1' ? 'mainnet-default' : 'devnet')).replace(/api[_-]?key=[^&]+/ig, 'api_key=…') });
+      return out(200, { ok: true, mint: MINT.toBase58(), live: true, rwa: true, jobs: Object.keys(rwa.jobs).length, houseSoftgoMs: RWA_HOUSE_VOTE_MS, houseRewardAgis: HOUSE_REWARD_AGIS, ecoWallet: ECO_WALLET.toBase58(), mainnet: process.env.MAINNET === '1', payer: payerPk ? payerPk.slice(0, 8) + '…' + payerPk.slice(-4) : null, rpc: (process.env.SOLANA_RPC || (process.env.MAINNET === '1' ? 'mainnet-default' : 'devnet')).replace(/api[_-]?key=[^&]+/ig, 'api_key=…') });
     }
   if (req.method === 'GET' && url === '/api/supply') {
     return Promise.all([conn.getTokenSupply(MINT), conn.getSlot().catch(() => null)])
@@ -283,12 +309,43 @@ http.createServer((req, res) => {
       const seals = Object.values(rwa.jobs).filter(j => j.fingerprint === fp).sort((a, b) => a.created.localeCompare(b.created)).map(pub).map(({ votes, ...r }) => ({ ...r, keyWrap: undefined, walletRecovery: !!r.keyWrap, votes: votes.length, meta: { type: r.meta.type, pages: r.meta.pages, bytes: r.meta.bytes } }));
       return out(200, { ok: true, fingerprint: fp, found: seals.length > 0, seals });
     }
-    const m = url.match(/^\/api\/rwa\/jobs\/([0-9a-f]{12})(\/vote|\/keywrap|\/receipt-retry)?$/);
+    const m = url.match(/^\/api\/rwa\/jobs\/([0-9a-f]{12})(\/vote|\/keywrap|\/receipt-retry|\/chain)?$/);
     if (req.method === 'GET' && m && !m[2]) {
       const j = rwa.jobs[m[1]]; if (!j) return out(404, { ok: false, error: 'no such job' });
       const r = pub(j);
       if (qs.get('full') === '1' && j.ctFile) r.ciphertextB64 = fs.readFileSync(`${RWA_DIR}/${j.ctFile}`, 'utf8');
       return out(200, { ok: true, job: r });
+    }
+    if (req.method === 'GET' && m && m[2] === '/chain') {
+      const j = rwa.jobs[m[1]]; if (!j) return out(404, { ok: false, error: 'no such job' });
+      if (!j.receiptTx) return out(200, { ok: true, id: j.id, onChain: false, reason: 'no receiptTx yet', api: { status: j.status, validUntil: j.validUntil || null, expired: !!(j.validUntil && Date.parse(j.validUntil) < Date.now()) } });
+      return (async () => {
+        let memo = null, err = null, slot = null, blockTime = null;
+        for (const c of [confirmConn, conn]) {
+          try {
+            const tx = await c.getTransaction(j.receiptTx, { maxSupportedTransactionVersion: 0, commitment: 'confirmed' });
+            if (!tx) continue;
+            slot = tx.slot; blockTime = tx.blockTime;
+            const logs = tx.meta?.logMessages || [];
+            const fromLog = logs.map(l => { const x = l.match(/Memo \(len \d+\): "(.+)"/); return x && x[1]; }).find(Boolean);
+            const keys = tx.transaction?.message?.staticAccountKeys || tx.transaction?.message?.accountKeys || [];
+            // Prefer log memo decode
+            memo = fromLog || null;
+            if (!memo && Array.isArray(tx.transaction?.message?.compiledInstructions || tx.transaction?.message?.instructions)) {
+              /* leave memo from log */
+            }
+            if (memo) break;
+          } catch (e) { err = String(e.message || e); }
+        }
+        let parsed = null;
+        if (memo && memo.startsWith('AEGIS/rwa/v1|')) {
+          const p = memo.split('|');
+          parsed = { version: p[0], id: p[1], fingerprint: p[2], status: p[3], sealedAt: p[4] || null, validUntil: (p[5] && p[5] !== 'forever') ? p[5] : null, forever: !p[5] || p[5] === 'forever' };
+        }
+        const vu = parsed?.validUntil || null;
+        const expired = !!(vu && Date.parse(vu) < Date.now());
+        return out(200, { ok: true, id: j.id, onChain: !!memo, receiptTx: j.receiptTx, explorer: 'https://solscan.io/tx/' + j.receiptTx, slot, blockTime, memo, parsed, expired, source: 'solana', note: 'Expiry and status come from the on-chain Memo, not invented by our API.' });
+      })().catch(e => out(502, { ok: false, error: String(e.message || e) }));
     }
     if (m && m[2] === '/receipt-retry' && (req.method === 'POST' || req.method === 'GET')) {
       return rwaReceiptRetry(m[1]).then(r => out(200, r), e => out(400, { ok: false, error: String(e.message || e) }));
