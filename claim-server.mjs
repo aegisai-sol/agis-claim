@@ -42,7 +42,7 @@ let queue = Promise.resolve(); // serialize mints
 
 // ---- RWA jobs API v1 (document verification; miners see ciphertext + hash only) ----
 // On verdict: Solana Memo receipt (AEGIS/rwa/v1|id|fp|status) from payer key; never blocks the vote.
-const MEMO_PROGRAM = new PublicKey('MemoSq4gqABAXKb96qnH8TuFvNy9CtaxGCzhuB7FF6Q');
+const MEMO_PROGRAM = new PublicKey('MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr');
 const RWA_MEMO = process.env.RWA_MEMO !== '0';
 const RWA_DIR = process.env.RWA_DIR || './deployments/rwa-jobs';
 const RWA_INDEX = RWA_DIR + '/index.json';
