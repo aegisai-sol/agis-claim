@@ -10,6 +10,7 @@ import { Connection, PublicKey, Transaction, TransactionInstruction, sendAndConf
 import { getOrCreateAssociatedTokenAccount, mintTo } from '@solana/spl-token';
 import { connection, loadKeypair, DECIMALS } from './common.mjs';
 import { computeClaim, FREE_WALLETS, deviceTier, capUnits } from './mine-rules.mjs';
+import { memoFromLogs, checkAnchorMemo, buildAnchorMemo } from './rwa-receipt.mjs';
 
 const MINT = new PublicKey('GhSiU95vtKwn7FBAW1u5krxYP2PnpFPotb1LJFZkbzhW');
 const GENESIS = Number(process.env.AGIS_GENESIS || Date.parse('2026-10-31T00:00:00Z') / 1000);
@@ -74,7 +75,7 @@ const HOUSE_REWARD_RAW = BigInt(Math.max(0, Math.floor(HOUSE_REWARD_AGIS * 10 **
 fs.mkdirSync(RWA_DIR, { recursive: true });
 const rwa = fs.existsSync(RWA_INDEX) ? JSON.parse(fs.readFileSync(RWA_INDEX, 'utf8')) : { jobs: {} };
 const rwaSave = () => fs.writeFileSync(RWA_INDEX, JSON.stringify(rwa, null, 1));
-const pub = j => { const vu = j.validUntil || null; const expired = !!(vu && Date.parse(vu) < Date.now()); return ({ receiptTx: j.receiptTx ?? null, receiptError: j.receiptError ?? null, receiptAt: j.receiptAt ?? null, id: j.id, fingerprint: j.fingerprint, meta: j.meta, status: j.status, created: j.created, validUntil: vu, expired, rewardEstimate: j.rewardEstimate ?? null, hasCiphertext: !!j.ctFile, keyWrap: j.keyWrap ?? null, wrapWallet: j.wrapWallet ?? null, wrapAlg: j.wrapAlg ?? null, votes: (j.votes || []).map(v => ({ wallet: v.wallet, ok: v.ok, checks: v.checks, at: v.at })), houseEcoTx: j.houseEcoTx ?? null, houseEcoAmount: j.houseEcoAmount ?? null, houseEcoTo: j.houseEcoTo ?? null, houseEcoError: j.houseEcoError ?? null }); };
+const pub = j => { const vu = j.validUntil || null; const expired = !!(vu && Date.parse(vu) < Date.now()); return ({ receiptTx: j.receiptTx ?? null, receiptError: j.receiptError ?? null, receiptAt: j.receiptAt ?? null, id: j.id, fingerprint: j.fingerprint, meta: j.meta, status: j.status, created: j.created, validUntil: vu, expired, rewardEstimate: j.rewardEstimate ?? null, hasCiphertext: !!j.ctFile, keyWrap: j.keyWrap ?? null, wrapWallet: j.wrapWallet ?? null, wrapAlg: j.wrapAlg ?? null, votes: (j.votes || []).map(v => ({ wallet: v.wallet, ok: v.ok, checks: v.checks, at: v.at })), houseEcoTx: j.houseEcoTx ?? null, houseEcoAmount: j.houseEcoAmount ?? null, houseEcoTo: j.houseEcoTo ?? null, houseEcoError: j.houseEcoError ?? null, anchorNeeded: !j.receiptTx, anchorMemo: j.receiptTx ? null : buildAnchorMemo(j), anchoredBy: j.anchoredBy ?? null }); };
 function rwaCreate(b) {
   if (!b || typeof b.fingerprint !== 'string' || !/^[0-9a-f]{64}$/i.test(b.fingerprint)) throw 'fingerprint must be sha256 hex';
   // Privacy: we never accept or store decryption keys. Reject any key-like field.
@@ -137,6 +138,7 @@ function houseVoteIfOpen(id) {
   } catch (e) { /* already voted / settled */ }
 }
 async function houseEcoReward(id) {
+  if (process.env.HOUSE_ECO_ENABLED !== '1') return; // disabled by owner lock: no firm-funded side txs for public seals
   const j0 = rwa.jobs[id]; if (!j0 || j0.houseEcoTx || j0.houseEcoPending) return;
   if (HOUSE_REWARD_RAW <= 0n) { j0.houseEcoNote = 'house reward disabled'; rwaSave(); return; }
   j0.houseEcoPending = true; rwaSave();
@@ -214,79 +216,33 @@ function rwaVote(id, v) {
 }
 
 function rwaReceipt(j) {
-  if (j.receiptTx || j.receiptPending) return;
-  if (!RWA_MEMO) { j.receiptTx = null; j.receiptError = 'memo disabled'; return; }
-  j.receiptPending = true;
-  queue = queue.then(async () => {
-    try {
-      const kp = getPayer();
-      const bal = await conn.getBalance(kp.publicKey, 'confirmed');
-      if (bal < MIN_SOL_LAMPORTS) throw new Error('low SOL on payer (' + bal + ' lamports · ' + kp.publicKey.toBase58().slice(0, 8) + '…)');
-      // Timestamped seal receipt on Solana L1 (immutable hash+time+verdict). Not an eIDAS qualified notary.
-      const sealedAt = j.created || new Date().toISOString();
-      const memo = `AEGIS/rwa/v1|${j.id}|${j.fingerprint}|${j.status}|${sealedAt}|${j.validUntil || 'forever'}`;
-      let lastErr = null;
-      for (let attempt = 0; attempt < 3; attempt++) {
-        try {
-          const latest = await conn.getLatestBlockhash('confirmed');
-          if (!latest?.blockhash) throw new Error('no blockhash from RPC');
-          const ix = new TransactionInstruction({ programId: MEMO_PROGRAM, keys: [{ pubkey: kp.publicKey, isSigner: true, isWritable: false }], data: Buffer.from(memo, 'utf8') });
-          const tx = new Transaction();
-          tx.add(ix);
-          tx.feePayer = kp.publicKey;
-          tx.recentBlockhash = latest.blockhash;
-          if (latest.lastValidBlockHeight != null) tx.lastValidBlockHeight = latest.lastValidBlockHeight;
-          const sig = await sendAndConfirmTransaction(conn, tx, [kp], {
-            commitment: 'confirmed',
-            preflightCommitment: 'confirmed',
-            skipPreflight: false,
-            maxRetries: 8,
-          });
-          if (!(await waitSigLanded(sig))) {
-            // sendAndConfirm returned but publicnode lag — alternate RPC may still show it
-            throw new Error('Signature ' + sig + ' has expired: block height exceeded');
-          }
-          j.receiptTx = sig; j.receiptError = null; lastErr = null; break;
-        } catch (e) {
-          lastErr = e;
-          const maybe = sigFromErr(e);
-          if (maybe && await waitSigLanded(maybe).catch(() => false)) {
-            j.receiptTx = maybe; j.receiptError = null; lastErr = null; break;
-          }
-          if (attempt < 2) await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
-        }
-      }
-      if (lastErr) throw lastErr;
-    } catch (e) {
-      let msg = String(e.message || e);
-      // Last chance: salvage sig from error if it finalized on alternate RPC
-      const maybe = sigFromErr(e);
-      if (maybe) {
-        try {
-          if (await waitSigLanded(maybe)) { j.receiptTx = maybe; j.receiptError = null; msg = null; }
-        } catch {}
-      }
-      if (msg) { j.receiptTx = null; j.receiptError = msg.slice(0, 240); }
-    }
-    j.receiptAt = new Date().toISOString(); delete j.receiptPending; rwaSave();
-    // After on-chain receipt: if house soft-go voted, recycle reduced AGIS to eco
-    if ((j.votes || []).some(v => (v.checks || []).includes('house-softgo'))) {
-      try { houseEcoReward(j.id); } catch {}
-    }
-  }).catch(() => {});
+  // OWNER LOCK 2026-10-31: firm NEVER pays Solana fees for public seals. Sealer anchors via POST /receipt.
+  if (j.receiptTx) return;
+  j.receiptError = null; j.anchorNeeded = true; j.anchorMemo = buildAnchorMemo(j);
+}
+
+async function rwaReceiptSubmit(id, c) {
+  const j = rwa.jobs[id]; if (!j) throw 'no such job';
+  const sig = String(c?.receiptTx || '');
+  if (!/^[1-9A-HJ-NP-Za-km-z]{64,90}$/.test(sig)) throw 'bad receiptTx';
+  if (j.receiptTx) return { ok: true, id, receiptTx: j.receiptTx, reused: true };
+  let tx = null;
+  for (const cn of [confirmConn, conn]) { try { tx = await cn.getTransaction(sig, { maxSupportedTransactionVersion: 0, commitment: 'confirmed' }); if (tx) break; } catch {} }
+  if (!tx) throw 'tx not found on Solana yet — retry in a few seconds';
+  if (tx.meta?.err) throw 'tx failed on chain';
+  const keys = tx.transaction?.message?.staticAccountKeys || tx.transaction?.message?.accountKeys || [];
+  const feePayer = keys[0] ? (keys[0].toBase58 ? keys[0].toBase58() : String(keys[0].pubkey || keys[0])) : null;
+  let firm = null; try { firm = getPayer().publicKey.toBase58(); } catch {}
+  const r = checkAnchorMemo(memoFromLogs(tx.meta?.logMessages), j, { firmPayer: firm, feePayer });
+  if (!r.ok) throw r.error;
+  j.receiptTx = sig; j.receiptError = null; j.receiptAt = new Date().toISOString(); j.anchoredBy = feePayer; j.anchorNeeded = false;
+  rwaSave(); return { ok: true, id, receiptTx: sig, anchoredBy: feePayer };
 }
 
 async function rwaReceiptRetry(id) {
   const j = rwa.jobs[id]; if (!j) throw 'no such job';
-  if (j.status !== 'verified' && j.status !== 'failed') throw 'not settled';
   if (j.receiptTx) return { ok: true, id, receiptTx: j.receiptTx, reused: true };
-  const maybe = sigFromErr(j.receiptError || '');
-  if (maybe && await waitSigLanded(maybe).catch(() => false)) {
-    j.receiptTx = maybe; j.receiptError = null; j.receiptAt = new Date().toISOString(); rwaSave();
-    return { ok: true, id, receiptTx: maybe, salvaged: true };
-  }
-  delete j.receiptPending; j.receiptError = null; rwaReceipt(j);
-  return { ok: true, id, retried: true };
+  return { ok: false, id, anchorNeeded: true, memo: buildAnchorMemo(j), error: 'Anchor is paid by the sealer wallet. POST /api/rwa/jobs/:id/receipt { receiptTx }.' };
 }
 
 async function handle(c) {
@@ -352,7 +308,7 @@ http.createServer((req, res) => {
       const seals = Object.values(rwa.jobs).filter(j => j.fingerprint === fp).sort((a, b) => a.created.localeCompare(b.created)).map(pub).map(({ votes, ...r }) => ({ ...r, keyWrap: undefined, walletRecovery: !!r.keyWrap, votes: votes.length, meta: { type: r.meta.type, pages: r.meta.pages, bytes: r.meta.bytes } }));
       return out(200, { ok: true, fingerprint: fp, found: seals.length > 0, seals });
     }
-    const m = url.match(/^\/api\/rwa\/jobs\/([0-9a-f]{12})(\/vote|\/keywrap|\/receipt-retry|\/chain|\/house-eco-retry)?$/);
+    const m = url.match(/^\/api\/rwa\/jobs\/([0-9a-f]{12})(\/vote|\/keywrap|\/receipt-retry|\/receipt|\/chain|\/house-eco-retry)?$/);
     if (req.method === 'GET' && m && !m[2]) {
       const j = rwa.jobs[m[1]]; if (!j) return out(404, { ok: false, error: 'no such job' });
       const r = pub(j);
@@ -418,6 +374,7 @@ http.createServer((req, res) => {
       try {
         if (!m) out(200, rwaCreate(c));
         else if (m[2] === '/keywrap') out(200, rwaKeyWrap(m[1], c));
+        else if (m[2] === '/receipt') return rwaReceiptSubmit(m[1], c).then(r => out(200, r), e => out(400, { ok: false, error: String(e.message || e) }));
         else if (m[2] === '/receipt-retry') return rwaReceiptRetry(m[1]).then(r => out(200, r), e => out(400, { ok: false, error: String(e.message || e) }));
         else out(200, rwaVote(m[1], c));
       } catch (e) { out(400, { ok: false, error: String(e.message || e) }); }
