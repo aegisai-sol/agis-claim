@@ -51,7 +51,7 @@ const RWA_VOTES_NEEDED = Number(process.env.RWA_VOTES || 1);
 fs.mkdirSync(RWA_DIR, { recursive: true });
 const rwa = fs.existsSync(RWA_INDEX) ? JSON.parse(fs.readFileSync(RWA_INDEX, 'utf8')) : { jobs: {} };
 const rwaSave = () => fs.writeFileSync(RWA_INDEX, JSON.stringify(rwa, null, 1));
-const pub = j => ({ receiptTx: j.receiptTx ?? null, receiptError: j.receiptError ?? null, receiptAt: j.receiptAt ?? null, id: j.id, fingerprint: j.fingerprint, meta: j.meta, status: j.status, created: j.created, rewardEstimate: j.rewardEstimate ?? null, hasCiphertext: !!j.ctFile, votes: (j.votes || []).map(v => ({ wallet: v.wallet, ok: v.ok, checks: v.checks, at: v.at })) });
+const pub = j => ({ receiptTx: j.receiptTx ?? null, receiptError: j.receiptError ?? null, receiptAt: j.receiptAt ?? null, id: j.id, fingerprint: j.fingerprint, meta: j.meta, status: j.status, created: j.created, rewardEstimate: j.rewardEstimate ?? null, hasCiphertext: !!j.ctFile, keyWrap: j.keyWrap ?? null, wrapWallet: j.wrapWallet ?? null, wrapAlg: j.wrapAlg ?? null, votes: (j.votes || []).map(v => ({ wallet: v.wallet, ok: v.ok, checks: v.checks, at: v.at })) });
 function rwaCreate(b) {
   if (!b || typeof b.fingerprint !== 'string' || !/^[0-9a-f]{64}$/i.test(b.fingerprint)) throw 'fingerprint must be sha256 hex';
   // Privacy: we never accept or store decryption keys. Reject any key-like field.
@@ -71,6 +71,21 @@ function rwaCreate(b) {
   }
   rwa.jobs[id] = j; rwaSave();
   return { ok: true, id, created };
+}
+// Wave A2 wallet key-wrap. Client wraps its AES key with HKDF(Phantom sig of AEGIS/rwa-keywrap/v1|wallet|id|fp).
+// That derivation signature NEVER reaches us; we only get the opaque wrapped blob, authorised by a separate
+// attach signature (AEGIS/rwa-keywrap-attach/v1|wallet|id|fp|ts). Write-once. We never custody keys.
+// TODO social recovery (2-of-3 guardians, Shamir shares of the AES key) — design stub only.
+function rwaKeyWrap(id, v) {
+  const j = rwa.jobs[id]; if (!j) throw 'no such job';
+  if (j.keyWrap) throw 'keyWrap already set';
+  if (!v || typeof v.wallet !== 'string' || typeof v.msg !== 'string' || typeof v.sig !== 'string' || typeof v.keyWrap !== 'string') throw 'bad body';
+  if (!/^[A-Za-z0-9+/=]{40,400}$/.test(v.keyWrap) || v.msg.length > 300) throw 'bad keyWrap';
+  const [dom, w, jid, fp] = v.msg.split('|');
+  if (dom !== 'AEGIS/rwa-keywrap-attach/v1' || w !== v.wallet || jid !== id || fp !== j.fingerprint) throw 'bad message';
+  new PublicKey(w); if (!verify(v.wallet, v.msg, v.sig)) throw 'bad signature';
+  Object.assign(j, { keyWrap: v.keyWrap, wrapWallet: w, wrapAlg: 'hkdf-sha256(ed25519-sig)+aes-gcm-256/v1' }); rwaSave();
+  return { ok: true, id, wrapWallet: w };
 }
 function rwaVote(id, v) {
   const j = rwa.jobs[id]; if (!j) throw 'no such job';
@@ -161,10 +176,10 @@ http.createServer((req, res) => {
     const fm = url.match(/^\/api\/rwa\/by-fingerprint\/([0-9a-fA-F]{64})$/) || (url === '/api/rwa/by-fingerprint' && [0, qs.get('fp') || '']);
     if (req.method === 'GET' && fm) {
       const fp = String(fm[1]).toLowerCase(); if (!/^[0-9a-f]{64}$/.test(fp)) return out(400, { ok: false, error: 'fp must be sha256 hex' });
-      const seals = Object.values(rwa.jobs).filter(j => j.fingerprint === fp).sort((a, b) => a.created.localeCompare(b.created)).map(pub).map(({ votes, ...r }) => ({ ...r, votes: votes.length, meta: { type: r.meta.type, pages: r.meta.pages, bytes: r.meta.bytes } }));
+      const seals = Object.values(rwa.jobs).filter(j => j.fingerprint === fp).sort((a, b) => a.created.localeCompare(b.created)).map(pub).map(({ votes, ...r }) => ({ ...r, keyWrap: undefined, walletRecovery: !!r.keyWrap, votes: votes.length, meta: { type: r.meta.type, pages: r.meta.pages, bytes: r.meta.bytes } }));
       return out(200, { ok: true, fingerprint: fp, found: seals.length > 0, seals });
     }
-    const m = url.match(/^\/api\/rwa\/jobs\/([0-9a-f]{12})(\/vote)?$/);
+    const m = url.match(/^\/api\/rwa\/jobs\/([0-9a-f]{12})(\/vote|\/keywrap)?$/);
     if (req.method === 'GET' && m && !m[2]) {
       const j = rwa.jobs[m[1]]; if (!j) return out(404, { ok: false, error: 'no such job' });
       const r = pub(j);
@@ -177,7 +192,7 @@ http.createServer((req, res) => {
     req.on('end', () => {
       if (big) return;
       let c; try { c = JSON.parse(b); } catch { return out(400, { ok: false, error: 'bad json' }); }
-      try { out(200, m ? rwaVote(m[1], c) : rwaCreate(c)); } catch (e) { out(400, { ok: false, error: String(e.message || e) }); }
+      try { out(200, m ? (m[2] === '/keywrap' ? rwaKeyWrap(m[1], c) : rwaVote(m[1], c)) : rwaCreate(c)); } catch (e) { out(400, { ok: false, error: String(e.message || e) }); }
     });
     return;
   }

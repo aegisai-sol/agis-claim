@@ -21,3 +21,8 @@ await new Promise(r => setTimeout(r, 2500)); [s, d] = await j(B + '/jobs/' + id)
 console.log('ALL PASS');
 [s, d] = await j(B + '/by-fingerprint/' + fp); ok(s === 200 && d.found && d.seals.some(x => x.id === id) && !d.seals[0].ciphertextB64, 'by-fingerprint recovery');
 [s, d] = await j(B + '/by-fingerprint?fp=' + 'ab'.repeat(32)); ok(s === 200 && !d.found, 'by-fingerprint none');
+{ const am = `AEGIS/rwa-keywrap-attach/v1|${wallet}|${id}|${fp}|${Date.now()}`, kw = Buffer.alloc(60, 9).toString('base64');
+  [s, d] = await post(B + '/jobs/' + id + '/keywrap', { wallet, msg: am, sig: crypto.sign(null, Buffer.from(am), privateKey).toString('base64'), keyWrap: kw }); ok(s === 200 && d.wrapWallet === wallet, 'keywrap attach');
+  [s, d] = await post(B + '/jobs/' + id + '/keywrap', { wallet, msg: am, sig: 'x', keyWrap: kw }); ok(s === 400, 'keywrap write-once');
+  [s, d] = await j(B + '/jobs/' + id); ok(d.job.keyWrap === kw && d.job.wrapAlg, 'keywrap in job');
+  [s, d] = await j(B + '/by-fingerprint/' + fp); ok(d.seals.find(x => x.id === id).walletRecovery === true && !d.seals[0].keyWrap, 'by-fp hides blob'); }

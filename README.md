@@ -14,3 +14,4 @@ Mint: `GhSiU95vtKwn7FBAW1u5krxYP2PnpFPotb1LJFZkbzhW`
 
 ### Recovery (lost phone / lost key)
 `GET /api/rwa/by-fingerprint/:sha256` (or `?fp=`) — public fields only (id, status, receiptTx, created, minimal meta). Re-hash the same file to prove it matches an existing seal; no key needed. Key only needed to decrypt the stored ciphertext.
+`POST /api/rwa/jobs/:id/keywrap` {wallet,msg,sig,keyWrap} — Wave A2 wallet-bound key wrap blob, write-once; msg `AEGIS/rwa-keywrap-attach/v1|wallet|id|fp|ts`. Server never sees the key or the derivation signature.
