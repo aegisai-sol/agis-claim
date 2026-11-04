@@ -311,7 +311,10 @@ http.createServer((req, res) => {
       return out(200, { ok: true, mint: MINT.toBase58(), live: true, rwa: true, jobs: Object.keys(rwa.jobs).length, houseSoftgoMs: RWA_HOUSE_VOTE_MS, houseRewardAgis: HOUSE_REWARD_AGIS, houseMode: 'upload-only', ecoWallet: ECO_WALLET.toBase58(), mainnet: process.env.MAINNET === '1', payer: payerPk ? payerPk.slice(0, 8) + '…' + payerPk.slice(-4) : null, rpc: (process.env.SOLANA_RPC || (process.env.MAINNET === '1' ? 'mainnet-default' : 'devnet')).replace(/api[_-]?key=[^&]+/ig, 'api_key=…') });
     }
   if (req.method === 'GET' && url === '/api/supply') {
-    return Promise.all([conn.getTokenSupply(MINT), conn.getSlot().catch(() => null)])
+        // Primary RPC (Allnodes) rejects getTokenSupply as an "indexed" call without a personal token -> fall back to public RPCs.
+    const supplyConns = [conn, confirmConn];
+    const trySupply = async () => { let err; for (const c of supplyConns) { try { const s = await c.getTokenSupply(MINT); const slot = await c.getSlot().catch(() => null); return [s, slot]; } catch (e) {
+    return trySupply()
       .then(([s, slot]) => out(200, { ok: true, mint: MINT.toBase58(), supply: s.value.amount, uiAmount: s.value.uiAmount, uiAmountString: s.value.uiAmountString, decimals: s.value.decimals, slot }))
       .catch(e => out(502, { ok: false, error: String(e) }));
   }
