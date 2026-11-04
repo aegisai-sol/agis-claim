@@ -313,7 +313,7 @@ http.createServer((req, res) => {
   if (req.method === 'GET' && url === '/api/supply') {
         // Primary RPC (Allnodes) rejects getTokenSupply as an "indexed" call without a personal token -> fall back to public RPCs.
     const supplyConns = [conn, confirmConn];
-        const trySupply = async () => { let err; for (const c of supplyConns) { try { const s = await c.getTokenSupply(MINT); const slot = await c.getSlot().catch(() => null); return [s, slot]; } catch (e) { err = e; } }
+        const trySupply = async () => { let err; for (const c of supplyConns) { try { const s = await c.getTokenSupply(MINT); const slot = await c.getSlot().catch(() => null); return [s, slot]; } catch (e) { err = e; } } throw err; };
     return trySupply()
       .then(([s, slot]) => out(200, { ok: true, mint: MINT.toBase58(), supply: s.value.amount, uiAmount: s.value.uiAmount, uiAmountString: s.value.uiAmountString, decimals: s.value.decimals, slot }))
       .catch(e => out(502, { ok: false, error: String(e) }));
