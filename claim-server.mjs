@@ -108,6 +108,12 @@ function rwaCreate(b) {
     validUntil = new Date(Date.now() + h * 3600e3).toISOString();
   }
   const j = { id, fingerprint: b.fingerprint.toLowerCase(), meta, status: 'open', created, validUntil, rewardEstimate: Number(b.rewardEstimate) || null, votes: [] };
+  { // Zero-knowledge backup: refuse any payload that carries decrypt-key material.
+    const KEYF = /^(key|rawkey|aeskey|secret|decryptkey|privatekey|jwk|passphrase)$/i;
+    const scan = (o, d = 0) => { if (!o || typeof o !== 'object' || d > 4) return; for (const [k, v] of Object.entries(o)) { if (KEYF.test(k)) throw 'key material not accepted — keep your key on your device'; if (typeof v === 'string' && /agis1:[0-9a-f]{32,}/i.test(v)) throw 'key material not accepted — keep your key on your device'; scan(v, d + 1); } };
+    const { ciphertextB64: _ct, ...rest } = b; scan(rest);
+    if (b.ciphertextB64 && !(b.meta && b.meta.iv)) throw 'encrypted backup needs meta.iv (client-side AES-GCM)';
+  }
   if (typeof b.ciphertextB64 === 'string' && b.ciphertextB64.length) {
     if (!/^[A-Za-z0-9+/=]+$/.test(b.ciphertextB64)) throw 'ciphertext must be base64';
     fs.writeFileSync(`${RWA_DIR}/${id}.b64`, b.ciphertextB64); j.ctFile = id + '.b64';
