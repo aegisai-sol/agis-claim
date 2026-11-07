@@ -9,7 +9,7 @@ import nacl from 'tweetnacl';
 import { Connection, PublicKey, Transaction, TransactionInstruction, sendAndConfirmTransaction } from '@solana/web3.js';
 import { getOrCreateAssociatedTokenAccount, mintTo } from '@solana/spl-token';
 import { connection, loadKeypair, DECIMALS } from './common.mjs';
-import { computeClaim, FREE_WALLETS, deviceTier, capUnits } from './mine-rules.mjs';
+import { computeClaim, FREE_WALLETS, deviceTier, capUnits, scheduleGate, minedFromLedger, emittedUntil, eraOf, ERA, RATE0, MINE_POOL_BASE, MAX_SUPPLY_BASE, LAUNCH_BASE } from './mine-rules.mjs';
 import { memoFromLogs, checkAnchorMemo, buildAnchorMemo } from './rwa-receipt.mjs';
 import { loadSigner, attest, ATTEST_ALG } from './attest.mjs';
 import { issueBatch, parseBatch, gradeAnswers, MAX_TASKS } from './pov-tasks.mjs';
@@ -35,7 +35,22 @@ fs.mkdirSync('./deployments', { recursive: true });
 const ledger = fs.existsSync(LEDGER) ? JSON.parse(fs.readFileSync(LEDGER, 'utf8')) : { seen: {}, day: {} };
 const save = () => fs.writeFileSync(LEDGER, JSON.stringify(ledger, null, 1));
 const conn = connection();
-const confirmConn = new Connection('https://api.mainnet-beta.solana.com', 'confirmed');
+const confirmConn = new Connection(process.env.SOLANA_CONFIRM_RPC || 'https://api.mainnet-beta.solana.com', 'confirmed');
+// On-chain AGIS supply (base units, BigInt). Primary RPC may reject getTokenSupply (indexed call) -> fall back.
+// Throws if no RPC can read it; mint paths must then fail closed.
+async function readChainSupply() {
+  let err;
+  for (const c of [conn, confirmConn]) { try { return BigInt((await c.getTokenSupply(MINT)).value.amount); } catch (e) { err = e; } }
+  throw err || new Error('supply unavailable');
+}
+// Hard mine-pool ceiling (85% pool + halving schedule + max supply), chain-floored so a wiped ledger can't reset it.
+async function enforceSchedule(amount) {
+  let chainSupply;
+  try { chainSupply = await readChainSupply(); } catch { throw 'supply check unavailable, try later'; }
+  const g = scheduleGate({ amount: BigInt(amount), ledgerMined: minedFromLedger(ledger.day), chainSupply, nowSec: Date.now() / 1000, genesisSec: GENESIS });
+  if (!g.ok) throw g.error;
+  return g;
+}
 async function waitSigLanded(sig) {
   for (let i = 0; i < 30; i++) {
     for (const c of [confirmConn, conn]) {
@@ -174,6 +189,7 @@ async function houseEcoReward(id) {
       const kp = getPayer();
       const bal = await conn.getBalance(kp.publicKey, 'confirmed');
       if (bal < MIN_SOL_LAMPORTS) throw new Error('low SOL for house eco mint');
+      try { await enforceSchedule(HOUSE_REWARD_RAW); } catch (e) { throw new Error(String(e)); }
       const ata = await getOrCreateAssociatedTokenAccount(conn, kp, MINT, ECO_WALLET);
       let tx = null, lastErr = null;
       try {
@@ -292,6 +308,7 @@ async function handle(c) {
   const r = computeClaim({ tasks: n, fromSec: tf / 1000, genesisSec: GENESIS, unitBps: UNIT_BPS, wallet: w, day, ledgerDay: ledger.day, dayWallets: ledger.wallets[day] || [], dailyCap: DAILY_CAP, globalCap: GLOBAL_DAILY_CAP, free: Number(process.env.FREE_WALLETS || FREE_WALLETS) });
   if (!r.ok) throw r.error;
   const { amount: amt, used, gused } = r;
+  await enforceSchedule(amt); // fail closed: refuses past schedule / max supply / unreadable supply
   if ((await conn.getBalance(getPayer().publicKey)) < MIN_SOL_LAMPORTS) throw 'payout wallet low on SOL, try later';
   ledger.seen[dg] = 'pending'; save();
   try {
@@ -323,6 +340,17 @@ http.createServer((req, res) => {
     return trySupply()
       .then(([s, slot]) => out(200, { ok: true, mint: MINT.toBase58(), supply: s.value.amount, uiAmount: s.value.uiAmount, uiAmountString: s.value.uiAmountString, decimals: s.value.decimals, slot }))
       .catch(e => out(502, { ok: false, error: String(e) }));
+  }
+  if (req.method === 'GET' && url === '/api/mine/schedule') {
+    // Public audit: anyone can recompute this from Solana getTokenSupply + the published constants.
+    const nowSec = Date.now() / 1000, era = eraOf(nowSec, GENESIS), ledgerMined = minedFromLedger(ledger.day), allowed = emittedUntil(nowSec, GENESIS);
+    const base = { ok: true, mint: MINT.toBase58(), genesis: new Date(GENESIS * 1000).toISOString(), era, eraSeconds: ERA,
+      ratePerSecBase: String(era < 256 ? RATE0 >> BigInt(era) : 0n), minePoolBase: String(MINE_POOL_BASE), maxSupplyBase: String(MAX_SUPPLY_BASE),
+      launchBase: String(LAUNCH_BASE), emittedUntilBase: String(allowed), ledgerMinedBase: String(ledgerMined), decimals: DECIMALS };
+    return readChainSupply().then(chainSupply => {
+      const g = scheduleGate({ amount: 1n, ledgerMined, chainSupply, nowSec, genesisSec: GENESIS });
+      out(200, { ...base, chainSupplyBase: String(chainSupply), chainMinedBase: String(g.chainMined), minedTotalBase: String(g.minedTotal), headroomBase: String(g.headroom), withinSchedule: g.minedTotal <= allowed && chainSupply <= MAX_SUPPLY_BASE });
+    }).catch(() => out(200, { ...base, chainSupplyBase: null, chainMinedBase: null, minedTotalBase: null, headroomBase: null, withinSchedule: null, note: 'RPC unavailable; claims fail closed until supply is readable' }));
   }
   const ip = String(req.headers['x-forwarded-for'] || req.socket.remoteAddress).split(',')[0].trim();
   if (url.startsWith('/api/rwa')) {

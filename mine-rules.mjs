@@ -7,7 +7,21 @@
 //  - per-wallet and whole-network UTC-day caps clip, then fail closed.
 export const DECIMALS = 9;
 export const ERA = 2 * 365 * 24 * 3600;
-export const RATE0 = (8_500_000_000n * 10n ** 9n / 2n) / BigInt(ERA);
+// ---- Supply constants (single knob) ----
+// AGIS_MAX_SUPPLY (whole AGIS) is the ONE place to change the hard max. Default 10B = the live
+// mint GhSiU95vtKwn7FBAW1u5krxYP2PnpFPotb1LJFZkbzhW. (Older owner plan text says 1B: see README.)
+// Mine pool = 85% of max, launch (10% team + 5% eco, minted at TGE) = the other 15%.
+// RATE0 is derived so era 0 emits exactly half the mine pool (~2y halving).
+export const BASE = 10n ** 9n;
+export const MAX_SUPPLY_AGIS = (() => {
+  const v = process.env.AGIS_MAX_SUPPLY ?? '10000000000';
+  if (!/^[1-9][0-9]{0,15}$/.test(String(v))) throw new Error('AGIS_MAX_SUPPLY must be a positive integer (whole AGIS)');
+  return BigInt(v);
+})();
+export const MAX_SUPPLY_BASE = MAX_SUPPLY_AGIS * BASE;
+export const MINE_POOL_BASE = MAX_SUPPLY_BASE * 85n / 100n;
+export const LAUNCH_BASE = MAX_SUPPLY_BASE - MINE_POOL_BASE;
+export const RATE0 = (MINE_POOL_BASE / 2n) / BigInt(ERA);
 export const ONE_X_BPS = 10000n;
 export const FREE_WALLETS = 100;
 
@@ -62,4 +76,45 @@ export function capUnits(units, secs, k) {
   if (max < 1) throw new Error('implausible work');
   if (units > 2 * max) throw new Error('implausible work (units > 2x tier max)');
   return { units: Math.min(units, max), max, clipped: units > max };
+}
+
+// ---- Mine-pool schedule ceiling (85% pool + halving, wipe-safe via on-chain supply) ----
+// Daily caps are env-tunable; this is the hard invariant they can never break:
+//   (1) cumulative mined + amount <= emittedUntil(now) <= MINE_POOL  (halving schedule, 85% pool)
+//   (2) on-chain supply + amount <= MAX_SUPPLY                        (hard max mint ceiling)
+// minedTotal = max(ledger sum of every 'YYYY-MM-DD|*' day, on-chain supply - LAUNCH).
+// The chain term means a wiped/lost claim ledger cannot reset the ceiling, and anyone can
+// audit it from Solana alone: getTokenSupply(mint) - LAUNCH <= emittedUntil(now).
+// (Burns lower supply, so the chain term is a floor; the ledger term covers burned AGIS.)
+// Ported from aegisai repo 1a40710 (token/scripts/mine-rules.mjs); same shared vectors.
+export function emittedUntil(nowSec, genesisSec) {
+  if (!Number.isFinite(nowSec) || !Number.isFinite(genesisSec)) throw new Error('bad time');
+  const el = Math.floor(nowSec) - Math.floor(genesisSec);
+  if (el <= 0) return 0n;
+  const era = Math.floor(el / ERA);
+  let total = 0n;
+  for (let e = 0; e < Math.min(era, 256); e++) total += (RATE0 >> BigInt(e)) * BigInt(ERA);
+  const into = BigInt(el - era * ERA);
+  total += (era < 256 ? RATE0 >> BigInt(era) : 0n) * into;
+  return total < MINE_POOL_BASE ? total : MINE_POOL_BASE;
+}
+
+export function minedFromLedger(ledgerDay) {
+  let s = 0n;
+  for (const [k, v] of Object.entries(ledgerDay || {})) if (k.endsWith('|*')) s += BigInt(v);
+  return s;
+}
+
+// chainSupply: BigInt base units from getTokenSupply (required; caller must fail closed if RPC is down).
+export function scheduleGate({ amount, ledgerMined, chainSupply, nowSec, genesisSec, launch = LAUNCH_BASE }) {
+  if (typeof amount !== 'bigint' || amount <= 0n) throw new Error('bad amount');
+  if (typeof chainSupply !== 'bigint' || chainSupply < 0n) throw new Error('bad chain supply');
+  if (typeof ledgerMined !== 'bigint' || ledgerMined < 0n) throw new Error('bad ledger total');
+  const chainMined = chainSupply > launch ? chainSupply - launch : 0n;
+  const minedTotal = ledgerMined > chainMined ? ledgerMined : chainMined;
+  const allowed = emittedUntil(nowSec, genesisSec);
+  const out = { minedTotal, chainMined, ledgerMined, allowed, headroom: allowed > minedTotal ? allowed - minedTotal : 0n };
+  if (chainSupply + amount > MAX_SUPPLY_BASE) return { ok: false, error: 'exceeds max supply', ...out };
+  if (minedTotal + amount > allowed) return { ok: false, error: 'exceeds emission schedule', ...out };
+  return { ok: true, ...out };
 }

@@ -3,7 +3,18 @@
 Public mint-claim HTTPS service for [AegisAI](https://aegisai-sol.github.io/aegisai/).
 
 - `GET /api/health`
-- `POST /api/claim` — wallet-signed mining claims
+- `POST /api/claim` — wallet-signed mining claims (gated by the mine-pool schedule ceiling below)
+- `GET /api/mine/schedule` — public emission audit (era, rate, emittedUntil, ledger/chain mined, headroom, withinSchedule)
+
+### Mine-pool schedule ceiling (fail closed)
+Checked before every mine/house reward mint, on top of the env daily caps:
+- cumulative mined + amount ≤ `emittedUntil(now)` (halving every ~2y from `AGIS_GENESIS`, era-0 rate = pool/2/era; never exceeds the 85% mine pool)
+- on-chain supply + amount ≤ max supply
+- mined total = max(ledger sum of `YYYY-MM-DD|*`, on-chain supply − 15% launch) → a wiped ledger cannot reset the ceiling
+- supply unreadable on `SOLANA_RPC` and fallback `SOLANA_CONFIRM_RPC` (default api.mainnet-beta) → claim refused `supply check unavailable`
+- `AGIS_MAX_SUPPLY` (whole AGIS, default `10000000000` = live mint) is the single knob; pool 85% / launch 15% / rate derive from it.
+  Note: older owner plan text says 1B; chain mint + code use 10B. Setting 1B while chain supply is 1.5B would refuse every mint (fail closed).
+- Tests: `npm test` (unit + shared JS/Python vectors + fake-RPC E2E, no keys/network)
 
 **Secrets (host env only, never commit):**
 - `MINT_AUTH_JSON` — mint authority keypair JSON array
